@@ -1,16 +1,14 @@
-"""Carga de configuración y del token de acceso."""
+"""Carga de configuración."""
 
 from __future__ import annotations
 
 import os
 import re
-import subprocess
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 
 DEFAULT_CONFIG = Path("~/.config/ssh-vault/config.toml").expanduser()
-KEYCHAIN_SERVICE = "ssh-vault-mcp"
 NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 
 
@@ -31,9 +29,6 @@ class Server:
 @dataclass(frozen=True)
 class Config:
     servers: dict[str, Server]
-    listen_host: str = "127.0.0.1"
-    listen_port: int = 8765
-    allowed_hosts: tuple[str, ...] = ()
     command_timeout: int = 60
     max_output_bytes: int = 64 * 1024
     audit_log: Path = field(default_factory=lambda: Path("~/.local/state/ssh-vault/audit.log").expanduser())
@@ -73,28 +68,7 @@ def load_config(path: Path | None = None) -> Config:
             allow_commands=tuple(re.compile(p) for p in (patterns or ())),
         )
 
-    kwargs = {k: raw[k] for k in ("listen_host", "listen_port", "command_timeout", "max_output_bytes", "ssh_binary") if k in raw}
-    if "allowed_hosts" in raw:
-        kwargs["allowed_hosts"] = tuple(raw["allowed_hosts"])
+    kwargs = {k: raw[k] for k in ("command_timeout", "max_output_bytes", "ssh_binary") if k in raw}
     if "audit_log" in raw:
         kwargs["audit_log"] = Path(raw["audit_log"]).expanduser()
     return Config(servers=servers, **kwargs)
-
-
-def load_token() -> str:
-    """Token desde la variable SSH_VAULT_TOKEN o desde el Llavero de macOS."""
-    token = os.environ.get("SSH_VAULT_TOKEN")
-    if not token:
-        try:
-            token = subprocess.run(
-                ["security", "find-generic-password", "-s", KEYCHAIN_SERVICE, "-w"],
-                capture_output=True, text=True, check=True,
-            ).stdout.strip()
-        except (FileNotFoundError, subprocess.CalledProcessError):
-            token = ""
-    if len(token) < 32:
-        raise SystemExit(
-            "Falta un token de al menos 32 caracteres. Ejecuta deploy/install.sh "
-            "o define SSH_VAULT_TOKEN."
-        )
-    return token

@@ -1,58 +1,85 @@
 # ssh-vault — MCP personal para tus servidores SSH
 
 Usa los accesos SSH que viven en **una** de tus MacBook desde **cualquiera** de tus
-Macs (con Claude Code) sin copiar nunca las llaves privadas.
+Macs (con Claude Code) sin copiar nunca las llaves privadas. El canal es el propio
+SSH, así que no hay servidor HTTP, tokens ni servicios de terceros.
 
 ```
- MacBook A / B / C (clientes)                 MacBook "bóveda"                    Tus servidores
-┌────────────────────────┐   Tailscale    ┌──────────────────────────┐    SSH     ┌───────────┐
-│ Claude Code            │ ── HTTPS ────▶ │ tailscale serve :443     │ ─────────▶ │ web-prod  │
-│  MCP "ssh-vault"       │  (WireGuard,   │   └▶ ssh-vault 127.0.0.1 │            │ db        │
-│  Authorization: Bearer │   solo tu red) │       └▶ /usr/bin/ssh    │            │ backups   │
-└────────────────────────┘                │  ~/.ssh + Llavero macOS  │            └───────────┘
-                                          └──────────────────────────┘
+ MacBook cliente                          MacBook "bóveda"                       Tus servidores
+┌──────────────────────┐   SSH (llave    ┌─────────────────────────────────┐ SSH ┌───────────┐
+│ Claude Code          │   restringida)  │ sshd                            │ ──▶ │ web-prod  │
+│  MCP: ssh -T         │ ──────────────▶ │  └▶ command="python -m ssh_vault│     │ db        │
+│       ssh-vault      │   MCP por stdio │       --client macbook-air"     │     │ backups   │
+└──────────────────────┘                 │  ~/.ssh + Llavero de macOS      │     └───────────┘
+                                         └─────────────────────────────────┘
 ```
+
+Claude Code lanza `ssh -T ssh-vault` como si fuera un MCP local. En la bóveda,
+`authorized_keys` obliga a esa llave a ejecutar **solo** `ssh_vault`, que habla MCP
+por stdin/stdout y usa las llaves de la bóveda para llegar a tus servidores.
 
 ## Modelo de seguridad
 
 | Capa | Qué protege |
 |---|---|
-| **Las llaves no se mueven** | El servicio solo invoca `ssh`; ninguna herramienta MCP lee ni devuelve `~/.ssh`. Si roban una Mac cliente, no se lleva ninguna llave. |
-| **Red privada (Tailscale)** | El servicio escucha solo en `127.0.0.1`; `tailscale serve` lo publica con HTTPS **solo** dentro de tu tailnet. No hay puertos abiertos a Internet. El servidor se niega a arrancar si `listen_host` no es localhost. |
-| **Token Bearer** | 256 bits aleatorios guardados en el Llavero de macOS. Se comparan en tiempo constante, y cada intento fallido espera 1 s. |
+| **Las llaves no se mueven** | Ninguna herramienta MCP lee ni devuelve `~/.ssh`. Si roban una Mac cliente, no se lleva tus llaves de servidor. |
+| **Llave de cliente restringida** | `restrict,command="…"` en `authorized_keys`: esa llave no abre una shell, no reenvía puertos, agente ni X11, e ignora el comando que pida. Solo puede hablar con el MCP. *(Verificado contra un sshd real.)* |
+| **Una llave por Mac** | Cada cliente tiene su propia llave y su nombre aparece en la auditoría. Si pierdes una Mac, la revocas con `add-client.sh --remove <nombre>` sin afectar a las demás. |
+| **sshd endurecido** | Solo llaves públicas: sin contraseñas, sin root y solo tu usuario (`deploy/sshd_config.d/000-ssh-vault.conf`). |
 | **Lista de servidores** | Solo se aceptan los servidores declarados en `config.toml`. Los alias se validan para evitar la inyección de opciones de `ssh`. |
 | **Políticas por servidor** | `read_only = true` o `allow_commands = [regex…]` limitan qué se puede ejecutar. |
-| **Ssh endurecido** | `BatchMode=yes`, `StrictHostKeyChecking=yes`, `ForwardAgent=no`, timeout y salida truncada. |
-| **Auditoría** | Cada llamada, incluidas las denegadas, queda en `~/.local/state/ssh-vault/audit.log` (JSON Lines). |
-| **DNS rebinding** | Los encabezados `Host` y `Origin` se validan contra `allowed_hosts`. |
+| **ssh saliente endurecido** | `BatchMode=yes`, `StrictHostKeyChecking=yes`, `ForwardAgent=no`, timeout y salida truncada. |
+| **Auditoría** | Cada llamada, incluidas las denegadas, queda en `~/.local/state/ssh-vault/audit.log` con el nombre de la Mac cliente. |
 
-Para endurecerlo más, puedes:
-- usar las [ACL de Tailscale](https://tailscale.com/kb/1018/acls) para que solo tus Macs lleguen al puerto 443 de la bóveda;
-- cifrar las llaves con frase de contraseña y guardarlas con `UseKeychain yes`;
-- usar una llave **dedicada** para la bóveda, con `from="100.64.0.0/10"` o comandos restringidos en el `authorized_keys` del servidor.
-
-## Instalación en la Mac bóveda
+## 1. Mac bóveda (la que tiene las llaves)
 
 ```bash
-# Requisitos: Python 3.11+, Tailscale con sesión iniciada
 git clone <este repo> ~/ssh-vault && cd ~/ssh-vault
-./deploy/install.sh
-nano ~/.config/ssh-vault/config.toml          # declara tus servidores y allowed_hosts
-launchctl kickstart -k gui/$(id -u)/online.dvxlabs.ssh-vault
+./deploy/install.sh                              # venv + config de ejemplo + instrucciones
+nano ~/.config/ssh-vault/config.toml             # declara tus servidores
 ```
 
-Antes de declarar un servidor, conéctate a él una vez a mano (`ssh web-prod`) para que quede en `known_hosts`.
-Para que la bóveda siga accesible, no la dejes dormir cuando esté conectada a la corriente: `sudo pmset -c sleep 0`.
+Después:
+1. Activa **Ajustes del Sistema → General → Compartir → Sesión remota** solo para tu usuario.
+2. Aplica el endurecimiento de `sshd`. `install.sh` muestra los comandos exactos.
+3. Conéctate una vez a mano a cada servidor (`ssh web-prod`) para que quede en `known_hosts`.
+4. Evita que se duerma mientras esté conectada a la corriente: `sudo pmset -c sleep 0`.
 
-## Configuración en cada Mac cliente
+## 2. Hacer accesible la bóveda desde fuera
+
+Elige **una** opción:
+
+**A. Abrir un puerto en el router** (si tienes IP pública)
+- Redirige un puerto externo poco común (p. ej. `22022`) al puerto `22` de la bóveda.
+- Usa DNS dinámico (por ejemplo, el de tu router o el de Cloudflare) para tener un nombre fijo.
+- `sshd` solo acepta llaves y tu usuario, y la llave del cliente solo lanza el MCP.
+
+**B. Túnel inverso a uno de tus servidores** (si tienes CGNAT o no puedes abrir puertos)
+- La bóveda mantiene `ssh -R 127.0.0.1:2222:127.0.0.1:22 <tu-vps>` siempre activo. Para esto usa `deploy/tunnel.plist`.
+- El puerto `2222` queda escuchando **solo en localhost** del VPS: no se expone a Internet.
+- Los clientes saltan por el VPS con `ProxyJump`. En el VPS, dales una cuenta o llave limitada a ese túnel, por ejemplo `restrict,port-forwarding,permitopen="127.0.0.1:2222"`.
+
+## 3. Cada Mac cliente
 
 ```bash
-# Instala Tailscale con la misma cuenta y luego:
-./deploy/client-setup.sh https://mi-mac-boveda.tu-tailnet.ts.net/mcp
+# Opción A
+./deploy/client-setup.sh mi-casa.ddns.net 22022 tu_usuario
+# Opción B (túnel por tu VPS, cuyo alias SSH es "vps")
+./deploy/client-setup.sh localhost 2222 tu_usuario vps
 ```
 
-El script ejecuta `claude mcp add --transport http ssh-vault … --header "Authorization: Bearer …"`.
-Para Claude Desktop, usa el puente local `npx mcp-remote <url> --header "Authorization: Bearer <token>"`. Los conectores remotos de claude.ai salen desde la nube y no pueden llegar a tu tailnet, lo cual es justamente lo que quieres.
+El script:
+1. crea una llave `~/.ssh/ssh_vault_ed25519` (con frase de paso guardada en el Llavero);
+2. añade el host `ssh-vault` a `~/.ssh/config`;
+3. te muestra el comando `add-client.sh …` que debes ejecutar en la bóveda;
+4. hace la primera conexión, para que verifiques la huella de la bóveda;
+5. registra el MCP: `claude mcp add --scope user ssh-vault -- ssh -T ssh-vault`.
+
+Para Claude Desktop, añade lo mismo en `claude_desktop_config.json`:
+
+```json
+{ "mcpServers": { "ssh-vault": { "command": "ssh", "args": ["-T", "ssh-vault"] } } }
+```
 
 ## Herramientas MCP
 
@@ -62,15 +89,11 @@ Para Claude Desktop, usa el puente local `npx mcp-remote <url> --header "Authori
 | `test_connection(server)` | Comprueba que la bóveda puede autenticarse. |
 | `run_command(server, command, timeout_seconds?)` | Ejecuta el comando y devuelve el código de salida, stdout y stderr. |
 
-## Acceso SSH interactivo (sin Claude)
+## Notas
 
-Con Tailscale SSH activado en la bóveda (`tailscale up --ssh`), desde cualquier Mac:
-
-```bash
-ssh -t mi-mac-boveda ssh web-prod
-```
-
-La sesión salta a través de la bóveda, así que la llave sigue sin salir de ella. Evita `ssh -A` (agent forwarding) y `ProxyJump` con llaves copiadas.
+- **Llaves con frase de paso en la bóveda.** Las sesiones que abre `sshd` no heredan el ssh-agent de la sesión gráfica de macOS. `ssh_vault` lo busca automáticamente (`/private/tmp/com.apple.launchd.*/Listeners`), así que la bóveda debe tener tu sesión iniciada y las llaves cargadas (`ssh-add --apple-use-keychain`).
+- **Revocar un cliente:** `deploy/add-client.sh --remove <nombre>`.
+- **Acceso de terminal "a mano":** usa una llave distinta, sin `command=`, para entrar a la bóveda y desde ahí `ssh web-prod`. Así la llave del MCP sigue limitada.
 
 ## Desarrollo
 
@@ -78,4 +101,4 @@ La sesión salta a través de la bóveda, así que la llave sigue sin salir de e
 pip install -e '.[dev]' && pytest
 ```
 
-Las pruebas usan un binario `ssh` falso y verifican la autenticación, las políticas, la auditoría y el flujo MCP completo.
+Las pruebas usan un binario `ssh` falso y comprueban las políticas, la auditoría y el flujo MCP completo, tanto en memoria como como proceso stdio.

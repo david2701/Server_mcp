@@ -5,8 +5,6 @@ set -euo pipefail
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 APP_DIR="$HOME/.local/share/ssh-vault"
 CONF_DIR="$HOME/.config/ssh-vault"
-PLIST="$HOME/Library/LaunchAgents/online.dvxlabs.ssh-vault.plist"
-SERVICE="ssh-vault-mcp"
 
 echo "==> Entorno virtual en $APP_DIR"
 python3 -m venv "$APP_DIR/venv"
@@ -18,30 +16,20 @@ chmod 700 "$CONF_DIR"
 if [[ ! -f "$CONF_DIR/config.toml" ]]; then
   cp "$REPO_DIR/config.example.toml" "$CONF_DIR/config.toml"
   chmod 600 "$CONF_DIR/config.toml"
-  echo "==> Edita $CONF_DIR/config.toml con tus servidores"
 fi
 
-if ! security find-generic-password -s "$SERVICE" >/dev/null 2>&1; then
-  echo "==> Generando token y guardándolo en el Llavero (servicio: $SERVICE)"
-  security add-generic-password -a "$USER" -s "$SERVICE" -w "$(openssl rand -hex 32)"
-fi
+cat <<MSG
 
-echo "==> Servicio launchd"
-sed -e "s#__PYTHON__#$APP_DIR/venv/bin/python#" -e "s#__HOME__#$HOME#g" \
-  "$REPO_DIR/deploy/online.dvxlabs.ssh-vault.plist" > "$PLIST"
-launchctl bootout "gui/$(id -u)" "$PLIST" 2>/dev/null || true
-launchctl bootstrap "gui/$(id -u)" "$PLIST"
+Siguientes pasos en esta Mac:
+ 1. Declara tus servidores:      nano $CONF_DIR/config.toml
+ 2. Activa "Sesión remota" (Remote Login) solo para tu usuario:
+      Ajustes del Sistema > General > Compartir > Sesión remota
+ 3. Endurece sshd (solo llaves, sin contraseñas):
+      sudo cp $REPO_DIR/deploy/sshd_config.d/000-ssh-vault.conf /etc/ssh/sshd_config.d/
+      sudo sed -i '' "s/TU_USUARIO/$USER/" /etc/ssh/sshd_config.d/000-ssh-vault.conf
+      sudo launchctl kickstart -k system/com.openssh.sshd
+ 4. Por cada Mac cliente:        $REPO_DIR/deploy/add-client.sh <nombre> "<llave pública>"
 
-if command -v tailscale >/dev/null; then
-  echo "==> Publicando en tu tailnet (solo tus dispositivos lo ven)"
-  tailscale serve --bg 8765
-  DNS="$(tailscale status --json | python3 -c 'import json,sys;print(json.load(sys.stdin)["Self"]["DNSName"].rstrip("."))')"
-  echo
-  echo "URL MCP:  https://$DNS/mcp"
-  echo "Añade \"$DNS\" a allowed_hosts en $CONF_DIR/config.toml y ejecuta:"
-  echo "  launchctl kickstart -k gui/$(id -u)/online.dvxlabs.ssh-vault"
-else
-  echo "!! Instala Tailscale (https://tailscale.com/download) y ejecuta: tailscale serve --bg 8765"
-fi
-echo
-echo "Ver el token:  security find-generic-password -s $SERVICE -w"
+Huella de esta Mac (compárala la primera vez que conecte cada cliente):
+MSG
+ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub 2>/dev/null || true

@@ -1,20 +1,23 @@
-"""Servidor MCP "ssh-vault": expone tus servidores SSH sin exponer tus llaves."""
+"""Servidor MCP "ssh-vault": expone tus servidores SSH sin exponer tus llaves.
+
+Habla MCP por stdio. Las Macs cliente lo lanzan con `ssh <mac-bóveda>`, y la
+bóveda lo fuerza con `command="..."` en authorized_keys (ver deploy/add-client.sh).
+"""
 
 from __future__ import annotations
 
 import argparse
-import asyncio
-import hmac
+from pathlib import Path
 
 from mcp.server.mcpserver import MCPServer
-from mcp.server.transport_security import TransportSecuritySettings
+from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
 
 from . import runner
-from .config import Config, load_config, load_token
+from .config import NAME_RE, Config, load_config
 
 
-def build_mcp(cfg: Config) -> MCPServer:
+def build_mcp(cfg: Config, client: str = "local") -> MCPServer:
     mcp = MCPServer(
         name="ssh-vault",
         instructions=(
@@ -27,7 +30,7 @@ def build_mcp(cfg: Config) -> MCPServer:
     def get_server(name: str):
         server = cfg.servers.get(name)
         if server is None:
-            raise ValueError(f"Servidor desconocido: {name!r}. Usa list_servers.")
+            raise ToolError(f"Servidor desconocido: {name!r}. Usa list_servers.")
         return server
 
     @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
@@ -51,7 +54,7 @@ def build_mcp(cfg: Config) -> MCPServer:
         """Comprueba que la Mac bóveda puede autenticarse en el servidor."""
         s = get_server(server)
         result = await runner.run(cfg, s, "true", timeout=20)
-        runner.audit(cfg, tool="test_connection", server=s.name, exit_code=result.exit_code)
+        runner.audit(cfg, client=client, tool="test_connection", server=s.name, exit_code=result.exit_code)
         return "OK" if result.exit_code == 0 else result.render()
 
     @mcp.tool(annotations=ToolAnnotations(destructiveHint=True, openWorldHint=True))
@@ -65,13 +68,13 @@ def build_mcp(cfg: Config) -> MCPServer:
         """
         s = get_server(server)
         if not command.strip():
-            raise ValueError("El comando está vacío.")
+            raise ToolError("El comando está vacío.")
         if not s.is_allowed(command):
-            runner.audit(cfg, tool="run_command", server=s.name, command=command, denied=True)
-            raise PermissionError(f"Comando no permitido en {s.name} por la configuración.")
+            runner.audit(cfg, client=client, tool="run_command", server=s.name, command=command, denied=True)
+            raise ToolError(f"Comando no permitido en {s.name} por la configuración.")
         result = await runner.run(cfg, s, command, timeout_seconds)
         runner.audit(
-            cfg, tool="run_command", server=s.name, command=command,
+            cfg, client=client, tool="run_command", server=s.name, command=command,
             exit_code=result.exit_code, duration_s=round(result.duration_s, 2),
         )
         return result.render()
@@ -79,52 +82,16 @@ def build_mcp(cfg: Config) -> MCPServer:
     return mcp
 
 
-class BearerAuth:
-    """Middleware ASGI: exige `Authorization: Bearer <token>` en cada petición HTTP."""
-
-    def __init__(self, app, token: str):
-        self.app = app
-        self.expected = f"Bearer {token}".encode()
-
-    async def __call__(self, scope, receive, send):
-        if scope["type"] == "http":
-            supplied = dict(scope.get("headers") or []).get(b"authorization", b"")
-            if not hmac.compare_digest(supplied, self.expected):
-                await asyncio.sleep(1)  # frena intentos de fuerza bruta
-                await send({"type": "http.response.start", "status": 401,
-                            "headers": [(b"content-type", b"text/plain"),
-                                        (b"www-authenticate", b"Bearer")]})
-                await send({"type": "http.response.body", "body": b"unauthorized"})
-                return
-        await self.app(scope, receive, send)
-
-
-def build_app(cfg: Config, token: str):
-    hosts = [f"{h}:*" for h in ("127.0.0.1", "localhost", *cfg.allowed_hosts)] + list(cfg.allowed_hosts)
-    security = TransportSecuritySettings(
-        allowed_hosts=hosts,
-        allowed_origins=[f"https://{h}" for h in cfg.allowed_hosts],
-    )
-    app = build_mcp(cfg).streamable_http_app(transport_security=security, host=cfg.listen_host)
-    return BearerAuth(app, token)
-
-
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Servidor MCP ssh-vault")
+    parser = argparse.ArgumentParser(description="Servidor MCP ssh-vault (stdio)")
     parser.add_argument("--config", help="ruta a config.toml")
+    parser.add_argument("--client", default="local", help="nombre de la Mac cliente, para la auditoría")
     args = parser.parse_args()
-
-    import uvicorn
-    from pathlib import Path
+    if not NAME_RE.match(args.client):
+        raise SystemExit(f"nombre de cliente inválido: {args.client!r}")
 
     cfg = load_config(Path(args.config) if args.config else None)
-    if cfg.listen_host not in ("127.0.0.1", "localhost", "::1"):
-        raise SystemExit(
-            "ssh-vault sólo escucha en localhost; publícalo en tu red privada con "
-            "`tailscale serve`, nunca directamente en Internet."
-        )
-    uvicorn.run(build_app(cfg, load_token()), host=cfg.listen_host, port=cfg.listen_port,
-                log_level="info", proxy_headers=False)
+    build_mcp(cfg, client=args.client).run("stdio")
 
 
 if __name__ == "__main__":

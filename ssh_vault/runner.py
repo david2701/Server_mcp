@@ -7,7 +7,9 @@ y el Llavero de macOS como siempre.
 from __future__ import annotations
 
 import asyncio
+import glob
 import json
+import os
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -46,6 +48,23 @@ def ssh_argv(cfg: Config, server: Server, command: str) -> list[str]:
     ]
 
 
+def ssh_env() -> dict[str, str]:
+    """Entorno para ssh. Las sesiones abiertas por sshd en macOS no heredan el
+    ssh-agent de la sesión gráfica (el que carga las frases de paso del Llavero),
+    así que lo buscamos si SSH_AUTH_SOCK no está definido."""
+    env = dict(os.environ)
+    if not env.get("SSH_AUTH_SOCK"):
+        uid = os.getuid()
+        for sock in sorted(glob.glob("/private/tmp/com.apple.launchd.*/Listeners")):
+            try:
+                if os.stat(sock).st_uid == uid:
+                    env["SSH_AUTH_SOCK"] = sock
+                    break
+            except OSError:
+                continue
+    return env
+
+
 async def run(cfg: Config, server: Server, command: str, timeout: int | None = None) -> Result:
     timeout = min(timeout or cfg.command_timeout, cfg.command_timeout)
     start = time.monotonic()
@@ -54,6 +73,7 @@ async def run(cfg: Config, server: Server, command: str, timeout: int | None = N
         stdin=asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        env=ssh_env(),
     )
     try:
         out, err = await asyncio.wait_for(proc.communicate(), timeout)

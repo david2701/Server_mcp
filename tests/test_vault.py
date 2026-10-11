@@ -1,23 +1,18 @@
 import json
-import socket
 import stat
 import sys
-import threading
-import time
 from pathlib import Path
 
 import anyio
-import httpx2
 import pytest
-import uvicorn
 
 from mcp.client.client import Client
-from mcp.client.streamable_http import create_mcp_http_client, streamable_http_client
+from mcp.client.stdio import StdioServerParameters
 from ssh_vault.config import load_config
 from ssh_vault.runner import ssh_argv
-from ssh_vault.server import build_app
+from ssh_vault.server import build_mcp
 
-TOKEN = "t" * 40
+ROOT = Path(__file__).resolve().parents[1]
 
 FAKE_SSH = f"""#!{sys.executable}
 import sys
@@ -45,16 +40,18 @@ description = "producción"
 host = "deploy@db.example.com"
 read_only = true
 """)
-    return load_config(path)
+    return path
 
 
 def test_ssh_argv_hardening(cfg):
+    cfg = load_config(cfg)
     argv = ssh_argv(cfg, cfg.servers["web"], "ls")
     assert "BatchMode=yes" in argv and "ForwardAgent=no" in argv
     assert argv[-3:] == ["--", "web-alias", "ls"]
 
 
 def test_read_only_policy(cfg):
+    cfg = load_config(cfg)
     db = cfg.servers["db"]
     assert db.is_allowed("uptime")
     assert db.is_allowed("systemctl status nginx")
@@ -70,43 +67,54 @@ def test_rejects_bad_host(tmp_path):
         load_config(path)
 
 
-@pytest.fixture
-def base_url(cfg):
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        port = s.getsockname()[1]
-    server = uvicorn.Server(uvicorn.Config(build_app(cfg, TOKEN), host="127.0.0.1", port=port, log_level="warning"))
-    thread = threading.Thread(target=server.run, daemon=True)
-    thread.start()
-    while not server.started:
-        time.sleep(0.05)
-    yield f"http://127.0.0.1:{port}/mcp"
-    server.should_exit = True
-    thread.join(5)
+async def exercise(client):
+    names = {t.name for t in (await client.list_tools()).tools}
+    assert names == {"list_servers", "test_connection", "run_command"}
+
+    listing = await client.call_tool("list_servers", {})
+    assert "web" in listing.content[0].text and "solo lectura" in listing.content[0].text
+
+    ok = await client.call_tool("run_command", {"server": "web", "command": "uname -a"})
+    assert "host=web-alias cmd=uname -a" in ok.content[0].text
+
+    denied = await client.call_tool("run_command", {"server": "db", "command": "rm -rf /"})
+    assert denied.is_error
+    assert "no permitido" in denied.content[0].text
 
 
-def test_requires_token(base_url):
-    r = httpx2.post(base_url, json={}, headers={"Authorization": "Bearer wrong"})
-    assert r.status_code == 401
-    assert httpx2.post(base_url, json={}).status_code == 401
+def audit_events(cfg_path):
+    return [json.loads(line) for line in load_config(cfg_path).audit_log.read_text().splitlines()]
 
 
-def test_end_to_end(base_url, cfg):
+def test_in_memory(cfg):
     async def scenario():
-        http = create_mcp_http_client(headers={"Authorization": f"Bearer {TOKEN}"})
-        async with Client(streamable_http_client(base_url, http_client=http)) as client:
-            names = {t.name for t in (await client.list_tools()).tools}
-            assert names == {"list_servers", "test_connection", "run_command"}
-
-            listing = await client.call_tool("list_servers", {})
-            assert "web" in listing.content[0].text and "solo lectura" in listing.content[0].text
-
-            ok = await client.call_tool("run_command", {"server": "web", "command": "uname -a"})
-            assert "host=web-alias cmd=uname -a" in ok.content[0].text
-
-            denied = await client.call_tool("run_command", {"server": "db", "command": "rm -rf /"})
-            assert denied.is_error
+        async with Client(build_mcp(load_config(cfg), client="air")) as client:
+            await exercise(client)
 
     anyio.run(scenario)
-    events = [json.loads(line) for line in cfg.audit_log.read_text().splitlines()]
+    events = audit_events(cfg)
     assert [e.get("denied", False) for e in events] == [False, True]
+    assert {e["client"] for e in events} == {"air"}
+
+
+def test_stdio_process(cfg):
+    """Igual que lo lanzaría authorized_keys: un proceso que habla MCP por stdio."""
+    params = StdioServerParameters(
+        command=sys.executable,
+        args=["-m", "ssh_vault", "--config", str(cfg), "--client", "macbook-pro"],
+        cwd=ROOT,
+    )
+
+    async def scenario():
+        async with Client(params) as client:
+            await exercise(client)
+
+    anyio.run(scenario)
+    assert {e["client"] for e in audit_events(cfg)} == {"macbook-pro"}
+
+
+def test_rejects_bad_client_name(cfg):
+    import subprocess
+    r = subprocess.run([sys.executable, "-m", "ssh_vault", "--config", str(cfg), "--client", "a b"],
+                       cwd=ROOT, capture_output=True, text=True)
+    assert r.returncode != 0
