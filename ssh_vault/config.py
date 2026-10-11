@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -50,6 +51,10 @@ class Secret:
     extra_headers: tuple[tuple[str, str], ...] = ()
 
 
+def default_audit_log() -> Path:
+    return Path(os.environ.get("VAULT_AUDIT_LOG", "~/.local/state/ssh-vault/audit.log")).expanduser()
+
+
 @dataclass
 class Config:
     servers: dict[str, Server] = field(default_factory=dict)
@@ -57,7 +62,7 @@ class Config:
     value_of: Callable[[str], str | None] = lambda name: None
     command_timeout: int = 60
     max_output_bytes: int = 64 * 1024
-    audit_log: Path = field(default_factory=lambda: Path("~/.local/state/ssh-vault/audit.log").expanduser())
+    audit_log: Path = field(default_factory=lambda: default_audit_log())
     ssh_binary: str = "ssh"
     agent_sock: str | None = None       # ssh-agent efímero con las llaves de la bóveda
     known_hosts: str | None = None      # archivo temporal con las huellas fijadas

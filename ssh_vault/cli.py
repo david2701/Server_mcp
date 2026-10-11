@@ -12,6 +12,7 @@ import sys
 from pathlib import Path
 
 from . import bundle as B
+from .sshutil import SshError
 from .config import NAME_RE, secret_from_spec
 
 # Plantillas para no tener que recordar URLs ni cabeceras.
@@ -272,6 +273,17 @@ def cmd_ssh(a):
             b.ssh_keys[check_name(a.name)] = {"private": private, "public": public}
         mutate(put)
         print(f"Llave '{a.name}' guardada en la bóveda. Ya puedes borrar {path} si quieres.")
+    elif a.action == "generate":
+        from .sshutil import generate_key
+        private, public = generate_key(f"ssh-vault {a.name}")
+
+        def put(b):
+            if a.name in b.ssh_keys:
+                die(f"ya existe la llave {a.name!r}")
+            b.ssh_keys[check_name(a.name)] = {"private": private, "public": public}
+        mutate(put)
+        print(f"Llave '{a.name}' creada dentro de la bóveda. Añade esta línea al authorized_keys de tus servidores:\n")
+        print(public)
     elif a.action == "add":
         key = read().ssh_keys.get(a.name) or die(f"no existe la llave {a.name!r}")
         cmd = ["ssh-add"] + (["-t", a.ttl] if a.ttl != "0" else []) + ["-"]
@@ -299,24 +311,6 @@ def cmd_ssh(a):
 
 # ─── Servidores ─────────────────────────────────────────────────────────────────
 
-def scan_host_keys(host: str, port: int) -> list[str]:
-    r = subprocess.run(["ssh-keyscan", "-T", "8", "-p", str(port), "--", host], capture_output=True, text=True)
-    keys = []
-    for line in r.stdout.splitlines():
-        parts = line.split()
-        if len(parts) >= 3 and not line.startswith("#"):
-            keys.append(f"{parts[1]} {parts[2]}")
-    if not keys:
-        die(f"no pude obtener las huellas de {host}:{port} ({r.stderr.strip() or 'sin respuesta'})")
-    return sorted(set(keys))
-
-
-def fingerprints(keys: list[str]) -> list[str]:
-    r = subprocess.run(["ssh-keygen", "-lf", "-"], input="".join(f"x {k}\n" for k in keys),
-                       capture_output=True, text=True)
-    return r.stdout.splitlines()
-
-
 def cmd_server(a):
     if a.action == "list":
         for name, s in sorted(read().servers.items()):
@@ -338,6 +332,7 @@ def cmd_server(a):
     key = a.key or (next(iter(b.ssh_keys)) if len(b.ssh_keys) == 1 else None)
     if not key or key not in b.ssh_keys:
         die("indica --key <llave> (de `vault ssh list`)")
+    from .sshutil import fingerprints, scan_host_keys
     host_keys = [a.host_key] if a.host_key else scan_host_keys(host, a.port)
     spec = {"host": host, "user": user, "port": a.port, "key": key, "host_keys": host_keys,
             "description": a.description or "", "read_only": a.read_only,
@@ -495,6 +490,31 @@ def cmd_serve(a):
                 ssl_certfile=a.tls_cert, ssl_keyfile=a.tls_key)
 
 
+def cmd_ui(a):
+    """Panel local en el navegador de esta Mac: servidores, llaves, claves y dispositivos."""
+    import secrets
+    import socket as sk
+    import webbrowser
+
+    import uvicorn
+    from .localui import build_app
+
+    b = read()  # Touch ID / frase de paso una sola vez
+    port = a.port
+    if not port:
+        with sk.socket() as s_:
+            s_.bind(("127.0.0.1", 0))
+            port = s_.getsockname()[1]
+    token = secrets.token_urlsafe(24)
+    path = B.default_vault_path()
+    app = build_app(b, lambda: B.write(b, path), token, port, client=f"panel-{device_name()}")
+    url = f"http://127.0.0.1:{port}/login?t={token}"
+    print(f"Panel local: {url}\n(solo accesible desde esta Mac; Ctrl+C para cerrarlo)", file=sys.stderr)
+    if not a.no_open:
+        webbrowser.open(url)
+    uvicorn.run(app, host="127.0.0.1", port=port, log_level="warning")
+
+
 def cmd_mcp(a):
     """MCP local para tus agentes: servidores y APIs de la bóveda sin ver las llaves.
 
@@ -557,7 +577,7 @@ def main(argv: list[str] | None = None) -> None:
     s.set_defaults(fn=cmd_run)
 
     s = sub.add_parser("ssh", help="llaves SSH en la bóveda")
-    s.add_argument("action", choices=["list", "import", "add", "export", "rm"])
+    s.add_argument("action", choices=["list", "import", "generate", "add", "export", "rm"])
     s.add_argument("name", nargs="?")
     s.add_argument("path", nargs="?")
     s.add_argument("--ttl", default="8h", help="duración en ssh-agent (0 = sin límite)")
@@ -618,6 +638,11 @@ def main(argv: list[str] | None = None) -> None:
 
     sub.add_parser("mcp", help="servidor MCP local (stdio) para tus agentes").set_defaults(fn=cmd_mcp)
 
+    s = sub.add_parser("ui", help="panel local en el navegador: servidores SSH, llaves, claves, dispositivos")
+    s.add_argument("--port", type=int, default=0)
+    s.add_argument("--no-open", action="store_true", help="no abrir el navegador")
+    s.set_defaults(fn=cmd_ui)
+
     a = p.parse_args(argv)
     OPTS["allow_rollback"] = a.allow_rollback
     if a.cmd == "device" and a.action == "add" and not (a.name and a.key):
@@ -638,7 +663,7 @@ def main(argv: list[str] | None = None) -> None:
         die("indica --secrets openai,anthropic,...")
     try:
         a.fn(a)
-    except (B.VaultError, ValueError, FileNotFoundError, PermissionError) as err:
+    except (B.VaultError, ValueError, FileNotFoundError, PermissionError, SshError) as err:
         die(f"error: {err}")
 
 

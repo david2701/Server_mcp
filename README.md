@@ -22,9 +22,17 @@ Dos piezas que comparten la misma bóveda cifrada:
                                                  (usan vt_…)       (con la clave real)
 ```
 
-No es una web pública ni un servicio en la nube. En las Macs es un comando (`vault`) y
-un servidor MCP local. La parte web es **opcional** y la despliegas tú en tu propio
-servidor, detrás de HTTPS.
+No es una web pública ni un servicio en la nube:
+
+| Dónde | Qué | Cómo se abre |
+|---|---|---|
+| Tu Mac | **Panel local**: servidores SSH, llaves, claves de API, dispositivos, actividad de tus agentes | `vault ui` (solo `127.0.0.1`, Touch ID) |
+| Tu Mac | **MCP** para tus agentes (SSH + APIs sin ver las llaves) | `vault mcp` |
+| Tu Mac | **CLI** con todo lo anterior | `vault …` |
+| Un servidor tuyo (opcional) | **Pasarela**: panel de API keys por servicio + proxy de LLMs | `vault serve --panel`, detrás de HTTPS |
+
+Las llaves SSH **nunca** van a la pasarela: si alguien comprometiera ese servidor, no
+tendría acceso a los demás.
 
 ## Instalación (cada Mac)
 
@@ -54,8 +62,23 @@ Para tener la bóveda en iCloud:
 
 ## 2. Tus agentes y tus servidores, desde cualquier Mac
 
+**Con el panel local** (lo más cómodo):
+
 ```bash
-vault ssh import servidores ~/.ssh/id_ed25519      # la llave entra en la bóveda
+vault ui        # Touch ID → se abre el navegador en http://127.0.0.1:<puerto>
+```
+
+- **Llaves SSH:** genera una nueva (te muestra la línea para `authorized_keys`) o importa la tuya pegándola.
+- **Servidores:** usuario@host, puerto y llave. Te enseña las huellas del servidor para que las
+  confirmes, y luego quedan fijadas. Con **Probar** verificas que la conexión funciona.
+- **Actividad:** qué comandos ejecutaron tus agentes, desde qué Mac y con qué resultado
+  (incluidos los denegados).
+
+**O con la terminal:**
+
+```bash
+vault ssh generate servidores                      # llave nueva dentro de la bóveda (o:)
+vault ssh import servidores ~/.ssh/id_ed25519      # la tuya entra en la bóveda
 vault server add web deploy@203.0.113.10 --key servidores --description "Nginx + app"
 vault server add db  root@203.0.113.11 --key servidores --read-only
 #  → se fijan las huellas del servidor: todas tus Macs las verifican igual
@@ -143,6 +166,7 @@ vault ssh add servidores --ttl 8h                  # cargar la llave en tu ssh-a
 | La llave SSH acaba en disco | Va de la bóveda al agente por stdin. El agente es efímero y se destruye al terminar. |
 | Servidor suplantado | Huellas fijadas en la bóveda y `StrictHostKeyChecking=yes`. |
 | Key de un servicio filtrada | Se revoca en el panel sin tocar la clave del proveedor. La pasarela solo guarda hashes, admite caducidad y solo envía la clave al dominio del proveedor (sin redirecciones). |
+| Panel local expuesto | Solo escucha en `127.0.0.1`, con token de un solo uso en la URL, comprobación de `Host` contra DNS rebinding, CSRF, y nunca muestra llaves privadas ni valores de claves. |
 | Ataques al panel | Contraseña con scrypt y límite de intentos; cookie `HttpOnly` + `SameSite=Strict` + `Secure`; CSRF y comprobación de origen; CSP estricta, sin JavaScript; todo el HTML escapado. |
 | Servidor de la pasarela comprometido | Solo tiene las claves de LLM que le compartiste, nunca tus llaves SSH. Si ocurre, rota esas claves. |
 
@@ -165,6 +189,7 @@ Las pruebas cubren:
 - conexiones a un **sshd real** desde una "Mac" sin `~/.ssh`;
 - huella de servidor cambiada;
 - el MCP;
-- el panel (inicio de sesión, límite de intentos, CSRF, origen, XSS);
+- el panel local contra un sshd real (generar llave, añadir servidor, probar, huella cambiada, accesos);
+- el panel de la pasarela (inicio de sesión, límite de intentos, CSRF, origen, XSS);
 - la API de administración, caducidad y streaming;
 - los SDK oficiales a través del proxy.
