@@ -68,10 +68,39 @@ READ_ONLY_DEFAULTS = (
 )
 
 
+def secret_from_spec(name: str, spec: dict) -> Secret:
+    if not NAME_RE.match(name):
+        raise ValueError(f"nombre de secreto inválido: {name!r}")
+    base_url = spec.get("base_url")
+    if base_url is not None:
+        parts = urlsplit(base_url)
+        local = parts.hostname in ("127.0.0.1", "localhost", "::1")
+        if parts.scheme != "https" and not (parts.scheme == "http" and local):
+            raise ValueError(f"{name}: base_url debe usar https")
+        if not parts.hostname or parts.query or parts.fragment or "@" in parts.netloc:
+            raise ValueError(f"{name}: base_url inválida: {base_url!r}")
+        if not base_url.endswith("/"):
+            base_url += "/"
+    header_name, _, header_fmt = (spec.get("header") or "Authorization: Bearer {secret}").partition(":")
+    if "{secret}" not in header_fmt:
+        raise ValueError(f"{name}: 'header' debe contener {{secret}}")
+    return Secret(
+        name=name,
+        description=spec.get("description", ""),
+        base_url=base_url,
+        auth_header=header_name.strip(),
+        auth_format=header_fmt.strip(),
+        extra_headers=tuple((str(k), str(v)) for k, v in (spec.get("extra_headers") or {}).items()),
+    )
+
+
 def load_config(path: Path | None = None) -> Config:
     path = path or Path(os.environ.get("SSH_VAULT_CONFIG", DEFAULT_CONFIG))
-    with open(path, "rb") as fh:
-        raw = tomllib.load(fh)
+    if not path.exists() and path == DEFAULT_CONFIG:
+        raw = {}  # sin config.toml: sin servidores, todo sale de la bóveda portátil
+    else:
+        with open(path, "rb") as fh:
+            raw = tomllib.load(fh)
 
     servers: dict[str, Server] = {}
     for name, spec in raw.get("servers", {}).items():
@@ -96,27 +125,7 @@ def load_config(path: Path | None = None) -> Config:
     for name, spec in raw.get("secrets", {}).items():
         if not NAME_RE.match(name):
             raise ValueError(f"nombre de secreto inválido: {name!r}")
-        base_url = spec.get("base_url")
-        if base_url is not None:
-            parts = urlsplit(base_url)
-            local = parts.hostname in ("127.0.0.1", "localhost", "::1")
-            if parts.scheme != "https" and not (parts.scheme == "http" and local):
-                raise ValueError(f"{name}: base_url debe usar https")
-            if not parts.hostname or parts.query or parts.fragment or "@" in parts.netloc:
-                raise ValueError(f"{name}: base_url inválida: {base_url!r}")
-            if not base_url.endswith("/"):
-                base_url += "/"
-        header_name, _, header_fmt = spec.get("header", "Authorization: Bearer {secret}").partition(":")
-        if "{secret}" not in header_fmt:
-            raise ValueError(f"{name}: 'header' debe contener {{secret}}")
-        secrets[name] = Secret(
-            name=name,
-            description=spec.get("description", ""),
-            base_url=base_url,
-            auth_header=header_name.strip(),
-            auth_format=header_fmt.strip(),
-            extra_headers=tuple((str(k), str(v)) for k, v in spec.get("extra_headers", {}).items()),
-        )
+        secrets[name] = secret_from_spec(name, spec)
 
     clients: dict[str, Client] = {}
     for name, spec in raw.get("clients", {}).items():
