@@ -1,13 +1,13 @@
 """Ejecución de comandos remotos con el binario ssh del sistema.
 
-Las llaves privadas nunca se leen desde Python: ssh usa ~/.ssh, el ssh-agent
-y el Llavero de macOS como siempre.
+Las llaves privadas nunca se escriben en disco: viven en un ssh-agent efímero
+(ver sshagent.py) que solo existe mientras dura la sesión. Las huellas de los
+servidores vienen de la bóveda, así que funciona igual en cualquier Mac.
 """
 
 from __future__ import annotations
 
 import asyncio
-import glob
 import json
 import os
 import time
@@ -36,44 +36,44 @@ class Result:
         return "\n".join(parts)
 
 
-def ssh_argv(cfg: Config, server: Server, command: str) -> list[str]:
-    return [
+def ssh_argv(cfg: Config, server: Server, command: str | None = None, *, interactive: bool = False) -> list[str]:
+    argv = [
         cfg.ssh_binary,
-        "-o", "BatchMode=yes",            # nunca pedir contraseñas de forma interactiva
+        "-F", "none",                      # ignora ~/.ssh/config de este equipo
         "-o", "ConnectTimeout=10",
-        "-o", "StrictHostKeyChecking=yes",  # sólo hosts ya presentes en known_hosts
+        "-o", "StrictHostKeyChecking=yes",
         "-o", "ForwardAgent=no",
-        "-T",
-        "--", server.host, command,
+        "-o", "UpdateHostKeys=no",
+        "-p", str(server.port),
+        "-l", server.user,
     ]
-
-
-def ssh_env() -> dict[str, str]:
-    """Entorno para ssh. Las sesiones abiertas por sshd en macOS no heredan el
-    ssh-agent de la sesión gráfica (el que carga las frases de paso del Llavero),
-    así que lo buscamos si SSH_AUTH_SOCK no está definido."""
-    env = dict(os.environ)
-    if not env.get("SSH_AUTH_SOCK"):
-        uid = os.getuid()
-        for sock in sorted(glob.glob("/private/tmp/com.apple.launchd.*/Listeners")):
-            try:
-                if os.stat(sock).st_uid == uid:
-                    env["SSH_AUTH_SOCK"] = sock
-                    break
-            except OSError:
-                continue
-    return env
+    if cfg.known_hosts:
+        argv += ["-o", f"UserKnownHostsFile={cfg.known_hosts}", "-o", "GlobalKnownHostsFile=/dev/null"]
+    if cfg.agent_sock:
+        argv += ["-o", f"IdentityAgent={cfg.agent_sock}"]
+    if cfg.keys_dir and server.key:
+        # Solo la llave asignada a este servidor (se elige por su parte pública).
+        argv += ["-o", "IdentitiesOnly=yes", "-o", f"IdentityFile={cfg.keys_dir}/{server.key}.pub"]
+    if not interactive:
+        argv += ["-o", "BatchMode=yes", "-T"]
+    argv += ["--", server.host]
+    if command is not None:
+        argv.append(command)
+    return argv
 
 
 async def run(cfg: Config, server: Server, command: str, timeout: int | None = None) -> Result:
     timeout = min(timeout or cfg.command_timeout, cfg.command_timeout)
     start = time.monotonic()
+    env = dict(os.environ)
+    if cfg.agent_sock:
+        env["SSH_AUTH_SOCK"] = cfg.agent_sock
     proc = await asyncio.create_subprocess_exec(
         *ssh_argv(cfg, server, command),
         stdin=asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
-        env=ssh_env(),
+        env=env,
     )
     try:
         out, err = await asyncio.wait_for(proc.communicate(), timeout)

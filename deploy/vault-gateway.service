@@ -1,0 +1,29 @@
+# /etc/systemd/system/vault-gateway.service
+# Pasarela de API keys + panel web. Ejecuta como un usuario sin privilegios dedicado.
+[Unit]
+Description=ssh-vault: pasarela de API keys
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=vault
+Group=vault
+ExecStart=/home/vault/.local/bin/vault serve --panel --host 127.0.0.1 --port 8787
+Restart=on-failure
+# Endurecimiento
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/vault/.config/ssh-vault /home/vault/.local/state/ssh-vault
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=yes
+CapabilityBoundingSet=
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

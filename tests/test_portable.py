@@ -27,7 +27,8 @@ KEY = "sk-live-SUPERSECRETO-123"
 
 
 class Device:
-    def __init__(self, tmp: Path, name: str, vault_file: Path):
+    def __init__(self, tmp: Path, name: str, vault_file: Path, protect: str = "none"):
+        self.protect = protect
         self.home = tmp / name
         self.home.mkdir()
         self.env = {
@@ -37,6 +38,7 @@ class Device:
             "VAULT_IDENTITY_FILE": str(self.home / ".config/ssh-vault/identity.txt"),
             "VAULT_FILE": str(vault_file),
             "PYTHONPATH": str(ROOT),
+            "VAULT_PASSPHRASE": f"frase-de-paso-larga-{name}",
         }
 
     def vault(self, *args, input=None, check=True):
@@ -53,7 +55,7 @@ def devices(tmp_path):
     vault_file.parent.mkdir()
     a = Device(tmp_path, "macbook-pro", vault_file)
     b = Device(tmp_path, "macbook-air", vault_file)
-    a.vault("init", "--name", "macbook-pro")
+    a.vault("init", "--name", "macbook-pro", "--protect", "none", "--recovery-out", str(tmp_path / "rec.txt"))
     a.vault("set", "openai", "--provider", "openai", "--stdin", input=KEY)
     return a, b, vault_file
 
@@ -70,7 +72,7 @@ def test_file_is_encrypted_and_readable_by_owner(devices):
 def test_second_device_flow(devices):
     a, b, _ = devices
     assert b.vault("get", "openai", check=False).returncode != 0  # sin identidad
-    pub = b.vault("whoami").stdout.strip()
+    pub = b.vault("whoami", "--protect", "none").stdout.strip()
     assert pub.startswith("age1")
     assert b.vault("get", "openai", check=False).returncode != 0  # aún no autorizada
     a.vault("device", "add", "macbook-air", pub)
@@ -147,7 +149,7 @@ def test_share_with_someone_by_ssh_key(devices, tmp_path):
 
     # El amigo, con su propia bóveda, lo importa usando su llave SSH
     friend = Device(tmp_path, "amigo-home", tmp_path / "amigo-vault.age")
-    friend.vault("init")
+    friend.vault("init", "--protect", "none", "--recovery-out", str(tmp_path / "rec-amigo.txt"))
     friend.vault("import", str(pkg), "--identity", str(friend_key))
     assert friend.vault("get", "openai").stdout == KEY
 
@@ -160,7 +162,7 @@ def test_share_with_someone_by_ssh_key(devices, tmp_path):
     # Un tercero no puede abrirlo
     other = sshkey(tmp_path, "otro")
     stranger = Device(tmp_path, "otro-home", tmp_path / "otro-vault.age")
-    stranger.vault("init")
+    stranger.vault("init", "--protect", "none", "--recovery-out", str(tmp_path / "rec-otro.txt"))
     assert stranger.vault("import", str(pkg), "--identity", str(other), check=False).returncode != 0
 
 

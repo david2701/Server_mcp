@@ -1,24 +1,34 @@
-"""Carga de configuración."""
+"""Modelos de servidores y secretos, construidos a partir del contenido de la bóveda."""
 
 from __future__ import annotations
 
-import os
 import re
-import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Callable
 from urllib.parse import urlsplit
 
-from .secrets import FileStore, KeychainStore, SecretStore
-
-DEFAULT_CONFIG = Path("~/.config/ssh-vault/config.toml").expanduser()
 NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
+HOST_RE = re.compile(r"^[A-Za-z0-9_.:\[\]-]{1,253}$")
+USER_RE = re.compile(r"^[a-z_][a-z0-9_.-]{0,31}$", re.IGNORECASE)
+
+# Comandos permitidos por defecto en servidores read_only sin lista propia.
+READ_ONLY_DEFAULTS = (
+    r"(uptime|df -h|free -m|whoami|hostname|uname -a)",
+    r"(systemctl status|journalctl -u) [A-Za-z0-9_.@-]+( -n [0-9]+)?( --no-pager)?",
+    r"(docker ps|docker compose ps)( -a)?",
+    r"tail -n [0-9]+ /var/log/[A-Za-z0-9_./-]+",
+)
 
 
 @dataclass(frozen=True)
 class Server:
     name: str
-    host: str  # alias de ~/.ssh/config o user@host
+    host: str
+    user: str = "root"
+    port: int = 22
+    key: str = ""                       # nombre de la llave SSH de la bóveda
+    host_keys: tuple[str, ...] = ()     # huellas fijadas al dar de alta el servidor
     description: str = ""
     read_only: bool = False
     allow_commands: tuple[re.Pattern[str], ...] = ()
@@ -33,39 +43,25 @@ class Server:
 class Secret:
     name: str
     description: str = ""
-    # Si hay base_url, la bóveda puede usar el secreto como proxy (call_api) SOLO
-    # contra ese prefijo. Sin base_url, el secreto solo sirve para `get`.
+    # Con base_url, la bóveda puede usar el secreto como proxy SOLO contra ese prefijo.
     base_url: str | None = None
     auth_header: str = "Authorization"
     auth_format: str = "Bearer {secret}"
     extra_headers: tuple[tuple[str, str], ...] = ()
 
 
-@dataclass(frozen=True)
-class Client:
-    name: str
-    reveal: frozenset[str] = frozenset()  # secretos que puede leer en claro
-
-
-@dataclass(frozen=True)
+@dataclass
 class Config:
-    servers: dict[str, Server]
+    servers: dict[str, Server] = field(default_factory=dict)
     secrets: dict[str, Secret] = field(default_factory=dict)
-    clients: dict[str, Client] = field(default_factory=dict)
-    store: SecretStore = field(default_factory=KeychainStore)
+    value_of: Callable[[str], str | None] = lambda name: None
     command_timeout: int = 60
     max_output_bytes: int = 64 * 1024
     audit_log: Path = field(default_factory=lambda: Path("~/.local/state/ssh-vault/audit.log").expanduser())
     ssh_binary: str = "ssh"
-
-
-# Comandos permitidos por defecto en servidores read_only sin lista propia.
-READ_ONLY_DEFAULTS = (
-    r"(uptime|df -h|free -m|whoami|hostname|uname -a)",
-    r"(systemctl status|journalctl -u) [A-Za-z0-9_.@-]+( -n [0-9]+)?( --no-pager)?",
-    r"(docker ps|docker compose ps)( -a)?",
-    r"tail -n [0-9]+ /var/log/[A-Za-z0-9_./-]+",
-)
+    agent_sock: str | None = None       # ssh-agent efímero con las llaves de la bóveda
+    known_hosts: str | None = None      # archivo temporal con las huellas fijadas
+    keys_dir: str | None = None         # partes públicas de las llaves, para elegir cuál usar
 
 
 def secret_from_spec(name: str, spec: dict) -> Secret:
@@ -94,57 +90,23 @@ def secret_from_spec(name: str, spec: dict) -> Secret:
     )
 
 
-def load_config(path: Path | None = None) -> Config:
-    path = path or Path(os.environ.get("SSH_VAULT_CONFIG", DEFAULT_CONFIG))
-    if not path.exists() and path == DEFAULT_CONFIG:
-        raw = {}  # sin config.toml: sin servidores, todo sale de la bóveda portátil
-    else:
-        with open(path, "rb") as fh:
-            raw = tomllib.load(fh)
-
-    servers: dict[str, Server] = {}
-    for name, spec in raw.get("servers", {}).items():
-        if not NAME_RE.match(name):
-            raise ValueError(f"nombre de servidor inválido: {name!r}")
-        host = spec.get("host", name)
-        if host.startswith("-") or any(c.isspace() for c in host):
-            raise ValueError(f"host inválido para {name!r}: {host!r}")
-        read_only = bool(spec.get("read_only", False))
-        patterns = spec.get("allow_commands")
-        if patterns is None and read_only:
-            patterns = READ_ONLY_DEFAULTS
-        servers[name] = Server(
-            name=name,
-            host=host,
-            description=spec.get("description", ""),
-            read_only=read_only,
-            allow_commands=tuple(re.compile(p) for p in (patterns or ())),
-        )
-
-    secrets: dict[str, Secret] = {}
-    for name, spec in raw.get("secrets", {}).items():
-        if not NAME_RE.match(name):
-            raise ValueError(f"nombre de secreto inválido: {name!r}")
-        secrets[name] = secret_from_spec(name, spec)
-
-    clients: dict[str, Client] = {}
-    for name, spec in raw.get("clients", {}).items():
-        reveal = frozenset(spec.get("reveal", ()))
-        unknown = reveal - secrets.keys()
-        if unknown:
-            raise ValueError(f"cliente {name!r}: secretos no declarados {sorted(unknown)}")
-        clients[name] = Client(name=name, reveal=reveal)
-
-    store: SecretStore
-    backend = raw.get("secrets_backend", "keychain")
-    if backend == "keychain":
-        store = KeychainStore()
-    elif backend == "file":
-        store = FileStore(Path(raw["secrets_file"]).expanduser())
-    else:
-        raise ValueError(f"secrets_backend desconocido: {backend!r}")
-
-    kwargs = {k: raw[k] for k in ("command_timeout", "max_output_bytes", "ssh_binary") if k in raw}
-    if "audit_log" in raw:
-        kwargs["audit_log"] = Path(raw["audit_log"]).expanduser()
-    return Config(servers=servers, secrets=secrets, clients=clients, store=store, **kwargs)
+def server_from_spec(name: str, spec: dict) -> Server:
+    if not NAME_RE.match(name):
+        raise ValueError(f"nombre de servidor inválido: {name!r}")
+    host, user = spec["host"], spec.get("user", "root")
+    if host.startswith("-") or not HOST_RE.match(host):
+        raise ValueError(f"host inválido para {name!r}: {host!r}")
+    if not USER_RE.match(user):
+        raise ValueError(f"usuario inválido para {name!r}: {user!r}")
+    port = int(spec.get("port", 22))
+    if not 0 < port < 65536:
+        raise ValueError(f"puerto inválido para {name!r}")
+    read_only = bool(spec.get("read_only", False))
+    patterns = spec.get("allow_commands")
+    if not patterns and read_only:
+        patterns = READ_ONLY_DEFAULTS
+    return Server(
+        name=name, host=host, user=user, port=port, key=spec.get("key", ""),
+        host_keys=tuple(spec.get("host_keys", ())), description=spec.get("description", ""),
+        read_only=read_only, allow_commands=tuple(re.compile(p) for p in (patterns or ())),
+    )

@@ -26,6 +26,7 @@ from starlette.responses import JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
 
 from . import apiproxy
+from . import keys as K
 from .bundle import Bundle
 from .config import Secret, secret_from_spec
 
@@ -49,7 +50,21 @@ def _error(status: int, message: str) -> JSONResponse:
     return JSONResponse({"error": {"type": "vault_error", "message": message}}, status_code=status)
 
 
-def build_app(bundle: Bundle, audit_log: Path | None = None) -> Starlette:
+class Gateway:
+    """Estado compartido entre el proxy y el panel."""
+
+    def __init__(self, bundle: Bundle, audit_log: Path | None, save):
+        self.bundle = bundle
+        self.audit_log = audit_log
+        self._save = save
+
+    def save(self) -> None:
+        if self._save:
+            self._save(self.bundle)
+
+
+def build_app(bundle: Bundle, audit_log: Path | None = None, save=None, panel: bool = False) -> Starlette:
+    gw = Gateway(bundle, audit_log, save)
     secrets: dict[str, Secret] = {
         name: secret_from_spec(name, spec) for name, spec in bundle.secrets.items() if spec.get("base_url")
     }
@@ -64,11 +79,10 @@ def build_app(bundle: Bundle, audit_log: Path | None = None) -> Starlette:
 
     async def proxy(request: Request) -> Response:
         name = request.path_params["secret"]
-        token = _token_from(request)
-        grant = bundle.token_lookup(token) if token else None
+        grant = K.lookup_key(bundle, _token_from(request))
         if grant is None:
             await anyio.sleep(1)
-            return _error(401, "token de la bóveda inválido")
+            return _error(401, "API key de la bóveda inválida, revocada o caducada")
         sec = secrets.get(name)
         if sec is None or name not in grant.get("secrets", ()):
             audit(app=grant["name"], secret=name, denied=True)
@@ -119,15 +133,16 @@ def build_app(bundle: Bundle, audit_log: Path | None = None) -> Starlette:
         return StreamingResponse(stream(), status_code=status, headers=out_headers)
 
     async def index(request: Request) -> Response:
-        token = _token_from(request)
-        grant = bundle.token_lookup(token) if token else None
+        grant = K.lookup_key(bundle, _token_from(request))
         if grant is None:
-            return _error(401, "token de la bóveda inválido")
+            return _error(401, "API key de la bóveda inválida, revocada o caducada")
         return JSONResponse({"service": "ssh-vault", "app": grant["name"],
                              "apis": sorted(set(grant["secrets"]) & secrets.keys())})
 
     methods = ["GET", "POST", "PUT", "PATCH", "DELETE"]
-    return Starlette(routes=[
-        Route("/", index),
-        Route("/{secret}/{path:path}", proxy, methods=methods),
-    ])
+    routes = []
+    if panel:
+        from .panel import panel_routes
+        routes += panel_routes(gw)
+    routes += [Route("/", index), Route("/{secret}/{path:path}", proxy, methods=methods)]
+    return Starlette(routes=routes)

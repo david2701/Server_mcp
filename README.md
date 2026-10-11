@@ -1,138 +1,155 @@
-# ssh-vault — tu bóveda portátil de llaves SSH y API keys
+# ssh-vault — tu bóveda de llaves SSH y API keys
 
-Un **único archivo cifrado** con tus llaves SSH, tus claves de LLMs (OpenAI, Anthropic,
-Gemini, Groq…) y los secretos de tus apps. Lo llevas a cualquier equipo como quieras
-(iCloud Drive, un repo git privado, un USB) y cada dispositivo lo abre con su propia
-identidad. **No depende de ningún servidor, VPN ni Mac encendida.**
+Dos piezas que comparten la misma bóveda cifrada:
+
+1. **En tus Macs (CLI + MCP):** en cualquier Mac pides a tus agentes que se conecten a tus
+   servidores. Usan la llave SSH de la bóveda y no la ven nunca.
+2. **En un servidor (pasarela web):** un panel donde generas una API key por servicio. El
+   servicio llama a la pasarela como si fuera OpenAI o Anthropic, y la pasarela pone la
+   clave real. Es proxy y API a la vez.
 
 ```
-              vault.age  (cifrado con age; puedes sincronizarlo por cualquier medio)
-       ┌──────────────────────────┼──────────────────────────┐
-       ▼                          ▼                          ▼
-  MacBook Pro               MacBook Air                 Servidor / VPS
-  identidad en Llavero      identidad en Llavero        identidad en archivo 0600
-  vault ssh add …           vault run … -- npm start    vault serve  (API para apps)
-  vault mcp  (Claude)
+          vault.age (cifrado con age; lo sincronizas como quieras: iCloud, git, USB)
+        ┌────────────────────────┼──────────────────────────┐
+        ▼                        ▼                          ▼
+   MacBook Pro              MacBook Air               Servidor "pasarela"
+   Touch ID                 Touch ID                  (bóveda propia, solo claves de LLM)
+   vault mcp ─► agentes     vault connect web         vault serve --panel
+       │                        │                       │  panel web  /_vault/
+       ▼ SSH                    ▼ SSH                    │  API admin  /_vault/api/keys
+   tus servidores ◄─────────────┘                       ▼
+                                                 tus servicios ──► OpenAI / Anthropic / …
+                                                 (usan vt_…)       (con la clave real)
 ```
 
-## Instalación
+No es una web pública ni un servicio en la nube. En las Macs es un comando (`vault`) y
+un servidor MCP local. La parte web es **opcional** y la despliegas tú en tu propio
+servidor, detrás de HTTPS.
+
+## Instalación (cada Mac)
 
 ```bash
+brew install age-plugin-se            # para Touch ID / Secure Enclave
 git clone https://github.com/david2701/server_mcp && cd server_mcp && pip install .
 ```
 
-Esto instala el comando `vault`. Requiere Python 3.11+.
-
-## Uso en 2 minutos
+## 1. Crear la bóveda
 
 ```bash
-# 1. Crear la bóveda (una sola vez, en tu Mac principal)
 vault init
-#    → guarda la LLAVE DE RECUPERACIÓN que imprime (papel o gestor de contraseñas)
-
-# 2. Guardar claves de LLMs (el valor se pide sin mostrarlo)
-vault set openai    --provider openai
-vault set anthropic --provider anthropic
-vault set gemini    --provider gemini
-vault set db_prod   --description "Postgres producción"     # secreto genérico, sin API
-
-# 3. Guardar tus llaves SSH
-vault ssh import servidores ~/.ssh/id_ed25519
-
-vault list
+#  → la identidad de esta Mac queda en el Secure Enclave (Touch ID)
+#  → guarda vault-recovery-key.txt fuera de línea y bórralo del equipo
 ```
 
 ### Añadir otra Mac
 
 ```bash
-# En la Mac nueva
-vault whoami                  # imprime su llave pública: age1…
-
-# En una Mac ya autorizada
-vault device add macbook-air age1…
-# Sincroniza vault.age (por iCloud, git...) y la Mac nueva ya puede abrirlo.
+vault whoami                          # en la Mac nueva → age1se1…
+vault device add macbook-air age1se1… # en una Mac ya autorizada
+# sincroniza vault.age; las demás Macs te pedirán `vault device trust` (ver Seguridad)
 ```
 
-Por defecto la bóveda está en `~/.config/ssh-vault/vault.age`. Para tenerla en iCloud:
+Para tener la bóveda en iCloud:
 `export VAULT_FILE=~/Library/Mobile\ Documents/com~apple~CloudDocs/vault.age`.
 
-## Usar tus llaves SSH en cualquier Mac
+## 2. Tus agentes y tus servidores, desde cualquier Mac
 
 ```bash
-vault ssh add servidores            # carga la llave en ssh-agent durante 8 h, sin escribirla en disco
-ssh web-prod                        # funciona como siempre
-vault ssh add servidores --ttl 0    # sin límite de tiempo
-vault ssh export servidores ~/.ssh/id_servidores   # solo si de verdad necesitas el archivo
+vault ssh import servidores ~/.ssh/id_ed25519      # la llave entra en la bóveda
+vault server add web deploy@203.0.113.10 --key servidores --description "Nginx + app"
+vault server add db  root@203.0.113.11 --key servidores --read-only
+#  → se fijan las huellas del servidor: todas tus Macs las verifican igual
+
+claude mcp add --scope user vault -- vault mcp      # una vez por Mac
 ```
 
-## Usar las claves en tus apps
+Luego basta con pedírselo al agente: *«revisa el espacio en disco de web y reinicia nginx»*.
 
-**Opción 1. Variables de entorno**, solo en memoria del proceso:
+- Al arrancar, `vault mcp` pide **Touch ID una vez** y carga la llave en un `ssh-agent`
+  efímero y privado. No se escribe en disco y se destruye al cerrar.
+- No usa tu `~/.ssh`: funciona igual en una Mac recién instalada.
+- Herramientas MCP: `list_servers`, `test_connection`, `run_command`, `list_secrets` y `call_api`.
+- `--read-only` o `--allow REGEX` limitan lo que el agente puede ejecutar en cada servidor.
+- Para entrar tú mismo: `vault connect web`.
+
+## 3. Pasarela con panel: API keys para tus servicios
+
+**En el servidor** (Linux con Caddy):
 
 ```bash
-vault run OPENAI_API_KEY=openai DATABASE_URL=db_prod -- npm start
+pip install .                                      # como usuario "vault"
+vault init --protect none --name pasarela          # bóveda propia del servidor
+vault whoami                                       # → age1… del servidor
 ```
 
-**Opción 2. API proxy de la bóveda** (recomendada para LLMs): tus apps nunca tienen la clave real.
+**En tu Mac:** comparte **solo** las claves de LLM, nunca tus llaves SSH.
 
 ```bash
-vault token create mi-app --secrets openai,anthropic   # token revocable para esa app
-vault serve                                             # http://127.0.0.1:8787
+vault set openai    --provider openai
+vault set anthropic --provider anthropic
+vault share openai anthropic --to age1…servidor -o llm.age
+scp llm.age vault@servidor:
 ```
+
+**De vuelta en el servidor:**
 
 ```bash
-# La app usa el SDK oficial sin cambios de código:
-OPENAI_BASE_URL=http://127.0.0.1:8787/openai        OPENAI_API_KEY=vt_…
-ANTHROPIC_BASE_URL=http://127.0.0.1:8787/anthropic  ANTHROPIC_API_KEY=vt_…
+vault import llm.age && rm llm.age
+vault admin password                               # contraseña del panel (mín. 12)
+sudo cp deploy/vault-gateway.service /etc/systemd/system/ && sudo systemctl enable --now vault-gateway
+sudo cp deploy/Caddyfile /etc/caddy/Caddyfile && sudo systemctl reload caddy   # HTTPS automático
 ```
 
-- Cada app tiene su propio token y solo accede a las APIs que le diste.
-- Si un token se filtra, lo revocas con `vault token rm mi-app` sin rotar tu clave de OpenAI.
-- Funciona con streaming (SSE). Verificado con los SDK oficiales de OpenAI y Anthropic.
-- La bóveda solo guarda el **hash** de cada token.
-- Para servirlo a otras máquinas, ejecútalo en un servidor tuyo con HTTPS: `vault serve --host 0.0.0.0 --tls-cert … --tls-key …`, o detrás de Caddy/nginx. Sin TLS, se niega a escuchar fuera de localhost.
-
-## Usar las claves desde Claude (MCP)
+Abre `https://vault.tudominio.com/_vault/`: creas una key por servicio, eliges a qué
+APIs puede llamar, le pones caducidad si quieres, ves su uso y la revocas con un clic.
+El servicio solo necesita:
 
 ```bash
-claude mcp add --scope user vault -- vault mcp
+OPENAI_BASE_URL=https://vault.tudominio.com/openai
+OPENAI_API_KEY=vt_…            # su key; la real nunca sale de la pasarela
 ```
 
-Claude obtiene `list_secrets` y `call_api`: llama a la API con tu clave **sin ver nunca el valor**.
-La clave solo se envía al `base_url` del secreto; no se siguen redirecciones y, si la API la repite en la respuesta, se borra.
-Si además tienes `~/.config/ssh-vault/config.toml` con servidores, también obtiene `run_command`, que usa tus llaves cargadas con `vault ssh add`.
+Funciona con los SDK oficiales y con streaming.
 
-## Compartir
+**Desde tus despliegues (API de administración):**
 
 ```bash
-# Con una persona, usando sus llaves SSH públicas de GitHub
-vault share openai ssh:servidores --to github:usuario -o para-usuario.age
-
-# Con un equipo concreto
-vault share anthropic --to age1… -o paquete.age
+vault admin token-create ci                        # token va_… para tu CI/CD
+curl -X POST https://vault.tudominio.com/_vault/api/keys \
+  -H "Authorization: Bearer va_…" \
+  -d '{"name":"mi-servicio","apis":["openai"],"expires_days":90}'
+# → {"key":"vt_…","env":{"OPENAI_BASE_URL":"…","OPENAI_API_KEY":"vt_…"}}
 ```
 
-El destinatario lo abre con `vault import paquete.age` o, **sin instalar nada**, con
-`age -d -i ~/.ssh/id_ed25519 paquete.age`. Nadie más puede leerlo.
+También: `GET /_vault/api/keys`, `DELETE /_vault/api/keys/{nombre}` y `GET /_vault/api/apis`.
+
+## Otros usos
+
+```bash
+vault run OPENAI_API_KEY=openai -- npm run dev     # secretos en variables de entorno, solo en memoria
+vault share openai --to github:usuario -o x.age    # compartir; se abre con `age -d -i ~/.ssh/id_ed25519`
+vault ssh add servidores --ttl 8h                  # cargar la llave en tu ssh-agent
+```
 
 ## Seguridad
 
-| | |
+| Riesgo | Cómo se cubre |
 |---|---|
-| **Cifrado estándar** | Formato [age](https://age-encryption.org) (X25519 + ChaCha20-Poly1305). Si un día dejas de usar esta herramienta, abres el archivo con el CLI oficial `age`. |
-| **Una identidad por dispositivo** | En macOS se guarda en el Llavero; en Linux, en un archivo 0600 (se rechaza si tiene otros permisos). Quitar un dispositivo (`vault device rm`) lo excluye de las versiones nuevas. |
-| **Recuperación** | `vault init` crea una llave de recuperación para cuando pierdas todos tus dispositivos. Úsala con `VAULT_IDENTITY_FILE=recuperacion.txt vault device add …`. |
-| **Sin valores en argumentos** | `vault set` pide el valor con `getpass` o lo lee de `--stdin`, así no queda en el historial ni en `ps`. Las llaves SSH van al agente por stdin. |
-| **Escritura atómica** | La bóveda nunca queda a medias si algo falla al guardar. |
-| **Auditoría** | Cada llamada al API proxy se registra en `~/.local/state/ssh-vault/audit.log`, sin claves ni cuerpos. |
+| Robo del archivo `vault.age` | Cifrado `age` (X25519 + ChaCha20-Poly1305). Sin una identidad autorizada no se puede abrir. |
+| Malware en tu Mac lee la llave | La identidad vive en el **Secure Enclave**: no se puede copiar ni exportar, y cada apertura pide **Touch ID**. Sin Touch ID hay frase de paso (scrypt) con diálogo del sistema. |
+| Un dispositivo comprometido añade a otro en silencio | Cada equipo recuerda los dispositivos autorizados y **se niega a abrir** si aparece uno nuevo, hasta que lo aceptas con `vault device trust`. También comprueba que la cabecera cifrada no tenga destinatarios ocultos. |
+| Alguien restaura una versión vieja (p. ej. con una clave ya cambiada) | Cada equipo recuerda la última revisión vista y **rechaza** las anteriores (`--allow-rollback` si es intencionado). |
+| Llave de recuperación expuesta | Se guarda en un archivo 0600, no se imprime en pantalla. |
+| La llave SSH acaba en disco | Va de la bóveda al agente por stdin. El agente es efímero y se destruye al terminar. |
+| Servidor suplantado | Huellas fijadas en la bóveda y `StrictHostKeyChecking=yes`. |
+| Key de un servicio filtrada | Se revoca en el panel sin tocar la clave del proveedor. La pasarela solo guarda hashes, admite caducidad y solo envía la clave al dominio del proveedor (sin redirecciones). |
+| Ataques al panel | Contraseña con scrypt y límite de intentos; cookie `HttpOnly` + `SameSite=Strict` + `Secure`; CSRF y comprobación de origen; CSP estricta, sin JavaScript; todo el HTML escapado. |
+| Servidor de la pasarela comprometido | Solo tiene las claves de LLM que le compartiste, nunca tus llaves SSH. Si ocurre, rota esas claves. |
 
-> **Ten en cuenta:**
-> - Quitar un dispositivo no borra lo que ya descifró. Si pierdes una Mac, rota las claves importantes.
-> - `vault get`/`vault run` entregan el valor a cualquier programa de tu usuario, incluido un agente con terminal. Para Claude usa `vault mcp` (`call_api`), y para las apps, el proxy con tokens.
-
-## Modo opcional: bóveda remota por SSH
-
-Si prefieres que las llaves **nunca** salgan de una Mac concreta, puedes usarla como bóveda remota y acceder a ella por SSH con llaves restringidas (`command=` en `authorized_keys`). Los scripts están en `deploy/`: `install.sh`, `add-client.sh`, `client-setup.sh`, `secret.sh`, `vault-run`. La configuración de ejemplo está en `config.example.toml`.
+**Límites que conviene conocer:**
+- Quitar un dispositivo no borra lo que ya descifró; si pierdes uno, rota las claves importantes.
+- Si sincronizas por git, el historial guarda versiones cifradas para los dispositivos de cada momento.
+- La pasarela usa `--protect none` porque no hay nadie para poner el dedo. Protégela como cualquier servidor.
 
 ## Desarrollo
 
@@ -140,4 +157,14 @@ Si prefieres que las llaves **nunca** salgan de una Mac concreta, puedes usarla 
 pip install -e '.[dev]' && pytest
 ```
 
-35 pruebas: varios dispositivos compartiendo y revocando, compatibilidad con el CLI `age`, carga en un `ssh-agent` real, compartir por llave SSH, proxy (tokens, permisos, streaming, cabeceras), MCP local y el modo remoto por SSH.
+Las pruebas cubren:
+- varios dispositivos compartiendo la bóveda y revocando acceso;
+- detección de dispositivos ocultos y de versiones restauradas;
+- frase de paso y llave de recuperación;
+- compatibilidad con el CLI `age`;
+- conexiones a un **sshd real** desde una "Mac" sin `~/.ssh`;
+- huella de servidor cambiada;
+- el MCP;
+- el panel (inicio de sesión, límite de intentos, CSRF, origen, XSS);
+- la API de administración, caducidad y streaming;
+- los SDK oficiales a través del proxy.
