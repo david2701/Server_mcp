@@ -1,9 +1,15 @@
 """Servidor MCP de la bóveda: tus agentes usan tus servidores y tus APIs sin ver
-ni las llaves SSH ni las claves. Se lanza con `vault mcp` (stdio) en cualquier Mac."""
+ni las llaves SSH ni las claves.
+
+- Local: `vault mcp` (stdio) en una Mac.
+- Remoto: `/mcp` de la app autoalojada (ver hosted.py); cada acceso (token u OAuth)
+  solo ve los servidores y APIs que le diste.
+"""
 
 from __future__ import annotations
 
 import json
+from typing import Callable
 
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
@@ -13,8 +19,16 @@ from . import apiproxy, runner
 from .config import Config
 
 
-def build_mcp(cfg: Config, client: str = "local") -> MCPServer:
-    mcp = MCPServer(
+Access = Callable[[], "tuple[str, Callable[[str, str], bool]]"]
+
+
+def build_mcp(cfg: Config | Callable[[], Config], client: str = "local", access: Access | None = None,
+              **mcp_kwargs) -> MCPServer:
+    """`cfg` puede ser un Config o una función que devuelve el actual (la app lo cambia en vivo).
+    `access()` devuelve (quién llama, permitido(tipo, nombre)) para la petición en curso."""
+    current = cfg if callable(cfg) else (lambda: cfg)
+    access = access or (lambda: (client, lambda kind, name: True))
+    mcp = MCPServer(**mcp_kwargs,
         name="ssh-vault",
         instructions=(
             "Bóveda personal del usuario. Ejecuta comandos en sus servidores "
@@ -25,18 +39,21 @@ def build_mcp(cfg: Config, client: str = "local") -> MCPServer:
     )
 
     def get_server(name: str):
-        server = cfg.servers.get(name)
-        if server is None:
-            raise ToolError(f"Servidor desconocido: {name!r}. Usa list_servers.")
-        return server
+        who, allowed = access()
+        server = current().servers.get(name)
+        if server is None or not allowed("server", name):
+            raise ToolError(f"Servidor desconocido o sin permiso: {name!r}. Usa list_servers.")
+        return server, who
 
     @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
     def list_servers() -> str:
-        """Lista los servidores configurados y sus restricciones."""
-        if not cfg.servers:
-            return "No hay servidores configurados."
+        """Lista los servidores a los que tienes acceso y sus restricciones."""
+        _, allowed = access()
+        visible = [s for s in current().servers.values() if allowed("server", s.name)]
+        if not visible:
+            return "No hay servidores disponibles para este acceso."
         lines = []
-        for s in cfg.servers.values():
+        for s in visible:
             if s.read_only:
                 mode = "solo lectura"
             elif s.allow_commands:
@@ -48,10 +65,11 @@ def build_mcp(cfg: Config, client: str = "local") -> MCPServer:
 
     @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
     async def test_connection(server: str) -> str:
-        """Comprueba que la Mac bóveda puede autenticarse en el servidor."""
-        s = get_server(server)
+        """Comprueba que la bóveda puede autenticarse en el servidor."""
+        s, who = get_server(server)
+        cfg = current()
         result = await runner.run(cfg, s, "true", timeout=20)
-        runner.audit(cfg, client=client, tool="test_connection", server=s.name, exit_code=result.exit_code)
+        runner.audit(cfg, client=who, tool="test_connection", server=s.name, exit_code=result.exit_code)
         return "OK" if result.exit_code == 0 else result.render()
 
     @mcp.tool(annotations=ToolAnnotations(destructiveHint=True, openWorldHint=True))
@@ -63,26 +81,29 @@ def build_mcp(cfg: Config, client: str = "local") -> MCPServer:
             command: comando a ejecutar en el shell remoto.
             timeout_seconds: límite opcional (no puede superar el máximo configurado).
         """
-        s = get_server(server)
+        s, who = get_server(server)
+        cfg = current()
         if not command.strip():
             raise ToolError("El comando está vacío.")
         if not s.is_allowed(command):
-            runner.audit(cfg, client=client, tool="run_command", server=s.name, command=command, denied=True)
+            runner.audit(cfg, client=who, tool="run_command", server=s.name, command=command, denied=True)
             raise ToolError(f"Comando no permitido en {s.name} por la configuración.")
         result = await runner.run(cfg, s, command, timeout_seconds)
         runner.audit(
-            cfg, client=client, tool="run_command", server=s.name, command=command,
+            cfg, client=who, tool="run_command", server=s.name, command=command,
             exit_code=result.exit_code, duration_s=round(result.duration_s, 2),
         )
         return result.render()
 
     @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
     def list_secrets() -> str:
-        """Lista los secretos de la bóveda (nunca sus valores) y a qué API dan acceso."""
-        if not cfg.secrets:
-            return "No hay secretos configurados."
+        """Lista las APIs que puedes usar con call_api (nunca muestra las claves)."""
+        _, allowed = access()
+        visible = [x for x in current().secrets.values() if allowed("secret", x.name)]
+        if not visible:
+            return "No hay APIs disponibles para este acceso."
         lines = []
-        for sec in cfg.secrets.values():
+        for sec in visible:
             target = f"call_api → {sec.base_url}" if sec.base_url else "solo para apps (sin proxy)"
             lines.append(f"- {sec.name} [{target}] {sec.description}".rstrip())
         return "\n".join(lines)
@@ -104,9 +125,11 @@ def build_mcp(cfg: Config, client: str = "local") -> MCPServer:
             body: cuerpo JSON (objeto o texto, opcional).
             headers: cabeceras extra (las de autenticación están prohibidas).
         """
+        who, allowed = access()
+        cfg = current()
         sec = cfg.secrets.get(secret)
-        if sec is None:
-            raise ToolError(f"Secreto desconocido: {secret!r}. Usa list_secrets.")
+        if sec is None or not allowed("secret", secret):
+            raise ToolError(f"Secreto desconocido o sin permiso: {secret!r}. Usa list_secrets.")
         value = cfg.value_of(sec.name)
         if value is None:
             raise ToolError(f"El secreto {secret!r} no tiene valor en la bóveda.")
@@ -116,10 +139,10 @@ def build_mcp(cfg: Config, client: str = "local") -> MCPServer:
             resp = await apiproxy.call(sec, value, method, path, body, headers,
                                        cfg.command_timeout, cfg.max_output_bytes)
         except apiproxy.ProxyError as err:
-            runner.audit(cfg, client=client, tool="call_api", secret=sec.name, method=method,
+            runner.audit(cfg, client=who, tool="call_api", secret=sec.name, method=method,
                          path=path, error=str(err))
             raise ToolError(str(err)) from None
-        runner.audit(cfg, client=client, tool="call_api", secret=sec.name, method=method.upper(),
+        runner.audit(cfg, client=who, tool="call_api", secret=sec.name, method=method.upper(),
                      path=path, status=resp.status)
         return f"status: {resp.status}\n{resp.body}" + ("\n[respuesta truncada]" if resp.truncated else "")
 

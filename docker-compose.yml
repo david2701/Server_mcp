@@ -1,0 +1,32 @@
+# Despliegue en tu VPS:
+#   1. Apunta el DNS de tu dominio a este servidor.
+#   2. Cambia VAULT_DOMAIN abajo (o en un archivo .env).
+#   3. docker compose up -d && docker compose logs vault   → abre el enlace de configuración inicial
+services:
+  vault:
+    build: .
+    restart: unless-stopped
+    environment:
+      VAULT_PUBLIC_URL: https://${VAULT_DOMAIN:-vault.tudominio.com}
+    volumes:
+      - vault-data:/data          # bóveda cifrada, identidad y registro de auditoría
+    # Sin "ports": solo Caddy llega a la app, por la red interna.
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    ports: ["80:80", "443:443"]
+    environment:
+      VAULT_DOMAIN: ${VAULT_DOMAIN:-vault.tudominio.com}
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+    depends_on: [vault]
+
+volumes:
+  vault-data:
+  caddy-data:

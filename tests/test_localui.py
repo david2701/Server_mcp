@@ -12,7 +12,10 @@ import uvicorn
 from ssh_vault import bundle as B
 from ssh_vault.localui import build_app
 from test_panel import Browser
-from test_servers import Sshd, pytestmark  # noqa: F401  (requiere OpenSSH)
+from test_servers import Sshd
+import test_servers
+
+pytestmark = test_servers.pytestmark  # requiere OpenSSH (sshd, ssh-agent)
 
 
 @pytest.fixture

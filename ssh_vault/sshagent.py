@@ -1,9 +1,12 @@
-"""ssh-agent efímero con las llaves de la bóveda.
+"""ssh-agent privado con las llaves de la bóveda.
 
 Las llaves privadas pasan por stdin directamente al agente y nunca se escriben en
-disco. En la carpeta temporal (0700) solo quedan datos públicos: el socket del
-agente, las huellas fijadas de los servidores y las partes públicas de las llaves.
-Todo se destruye al salir.
+disco. En la carpeta temporal (0700) solo hay datos públicos: el socket del agente,
+las huellas fijadas de los servidores y las partes públicas de las llaves.
+
+- `session()`: agente efímero para un comando o una sesión del CLI/MCP local.
+- `AgentManager`: agente que vive mientras la app está en marcha y se resincroniza
+  cuando añades, rotas o borras servidores desde el panel.
 """
 
 from __future__ import annotations
@@ -12,6 +15,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 from contextlib import contextmanager
 from dataclasses import replace
@@ -26,51 +30,83 @@ def known_hosts_line(server: Server, host_key: str) -> str:
     return f"{host} {host_key}"
 
 
-@contextmanager
-def session(bundle: Bundle, base: Config | None = None):
-    """Devuelve un Config listo para usar: servidores, secretos y agente efímero."""
-    tmp = Path(tempfile.mkdtemp(prefix="ssh-vault-"))
-    os.chmod(tmp, 0o700)
-    agent = None
-    try:
-        servers = {n: server_from_spec(n, s) for n, s in bundle.servers.items()}
-        secrets = {n: secret_from_spec(n, s) for n, s in bundle.secrets.items()}
+class AgentManager:
+    def __init__(self, base: Config | None = None):
+        self.base = base or Config()
+        self.tmp = Path(tempfile.mkdtemp(prefix="ssh-vault-"))
+        os.chmod(self.tmp, 0o700)
+        (self.tmp / "keys").mkdir()
+        self.sock = self.tmp / "agent.sock"
+        self.proc: subprocess.Popen | None = None
+        self.loaded: dict[str, str] = {}  # nombre → pública cargada en el agente
+        self.lock = threading.Lock()
+        self.cfg = self.base
 
-        (tmp / "known_hosts").write_text(
-            "".join(known_hosts_line(s, k) + "\n" for s in servers.values() for k in s.host_keys))
-        keys_dir = tmp / "keys"
-        keys_dir.mkdir()
-        needed = {s.key for s in servers.values() if s.key} & bundle.ssh_keys.keys()
-        for name in needed:
-            if bundle.ssh_keys[name].get("public"):
-                (keys_dir / f"{name}.pub").write_text(bundle.ssh_keys[name]["public"] + "\n")
+    def _env(self) -> dict[str, str]:
+        return {**os.environ, "SSH_AUTH_SOCK": str(self.sock)}
 
-        sock = tmp / "agent.sock"
-        if needed:
-            agent = subprocess.Popen(["ssh-agent", "-D", "-a", str(sock)],
+    def _start(self) -> None:
+        if self.proc and self.proc.poll() is None:
+            return
+        self.sock.unlink(missing_ok=True)
+        self.proc = subprocess.Popen(["ssh-agent", "-D", "-a", str(self.sock)],
                                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            for _ in range(100):
-                if sock.exists():
-                    break
-                time.sleep(0.02)
-            env = {**os.environ, "SSH_AUTH_SOCK": str(sock)}
-            for name in sorted(needed):
-                r = subprocess.run(["ssh-add", "-q", "-"], input=bundle.ssh_keys[name]["private"],
-                                   text=True, env=env, capture_output=True)
+        for _ in range(200):
+            if self.sock.exists():
+                return
+            time.sleep(0.02)
+        raise RuntimeError("ssh-agent no arrancó")
+
+    def sync(self, bundle: Bundle) -> Config:
+        """Ajusta agente, huellas y llaves públicas a lo que dice la bóveda."""
+        with self.lock:
+            servers = {n: server_from_spec(n, s) for n, s in bundle.servers.items()}
+            secrets = {n: secret_from_spec(n, s) for n, s in bundle.secrets.items()}
+            (self.tmp / "known_hosts").write_text(
+                "".join(known_hosts_line(s, k) + "\n" for s in servers.values() for k in s.host_keys))
+
+            needed = {s.key: bundle.ssh_keys[s.key] for s in servers.values()
+                      if s.key and s.key in bundle.ssh_keys}
+            if needed:
+                self._start()
+            for name, pub in list(self.loaded.items()):
+                if needed.get(name, {}).get("public") != pub:
+                    pub_file = self.tmp / "keys" / f"{name}.pub"
+                    subprocess.run(["ssh-add", "-d", str(pub_file)], env=self._env(), capture_output=True)
+                    pub_file.unlink(missing_ok=True)
+                    del self.loaded[name]
+            for name, key in needed.items():
+                if name in self.loaded:
+                    continue
+                r = subprocess.run(["ssh-add", "-q", "-"], input=key["private"], text=True,
+                                   env=self._env(), capture_output=True)
                 if r.returncode != 0:
                     raise RuntimeError(f"no se pudo cargar la llave {name!r}: {r.stderr.strip()} "
                                        "(¿tiene frase de paso? dentro de la bóveda no la necesita)")
+                (self.tmp / "keys" / f"{name}.pub").write_text(key["public"] + "\n")
+                self.loaded[name] = key["public"]
 
-        values = {n: s.get("value") for n, s in bundle.secrets.items()}
-        cfg = replace(base or Config(), servers=servers, secrets=secrets, value_of=values.get,
-                      agent_sock=str(sock) if needed else None,
-                      known_hosts=str(tmp / "known_hosts"), keys_dir=str(keys_dir))
-        yield cfg
-    finally:
-        if agent:
-            agent.terminate()
+            values = {n: s.get("value") for n, s in bundle.secrets.items()}
+            self.cfg = replace(self.base, servers=servers, secrets=secrets, value_of=values.get,
+                               agent_sock=str(self.sock) if self.loaded else None,
+                               known_hosts=str(self.tmp / "known_hosts"), keys_dir=str(self.tmp / "keys"))
+            return self.cfg
+
+    def close(self) -> None:
+        if self.proc:
+            self.proc.terminate()
             try:
-                agent.wait(5)
+                self.proc.wait(5)
             except subprocess.TimeoutExpired:
-                agent.kill()
-        shutil.rmtree(tmp, ignore_errors=True)
+                self.proc.kill()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+
+@contextmanager
+def session(bundle: Bundle, base: Config | None = None):
+    """Agente efímero: devuelve un Config listo para usar y lo destruye todo al salir."""
+    manager = AgentManager(base)
+    try:
+        yield manager.sync(bundle)
+    finally:
+        manager.close()

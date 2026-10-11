@@ -1,8 +1,7 @@
-# HTTPS automático (Let's Encrypt) delante de la pasarela.
-# Cambia el dominio y apunta su DNS a este servidor.
-vault.tudominio.com {
+# HTTPS automático (Let's Encrypt) delante de la app.
+{$VAULT_DOMAIN} {
 	encode zstd gzip
-	reverse_proxy 127.0.0.1:8787 {
-		flush_interval -1   # no retener el streaming (SSE) de los LLMs
+	reverse_proxy {$VAULT_UPSTREAM:vault:8787} {
+		flush_interval -1   # no retener el streaming (SSE) de MCP y de los LLMs
 	}
 }

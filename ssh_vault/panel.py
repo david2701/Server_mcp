@@ -33,7 +33,8 @@ SESSION_TTL = 8 * 3600
 MAX_FAILS, FAIL_WINDOW = 5, 15 * 60
 
 SECURITY_HEADERS = {
-    "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; "
+    "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; img-src 'self'; "
+                               "manifest-src 'self'; form-action 'self' https: http://127.0.0.1:* http://localhost:*; "
                                "frame-ancestors 'none'; base-uri 'none'",
     "X-Frame-Options": "DENY",
     "X-Content-Type-Options": "nosniff",
@@ -67,12 +68,30 @@ background:var(--accent);color:var(--accent-text)}button.link{background:none;co
 button.danger{background:none;color:var(--danger);border:1px solid var(--danger);padding:4px 10px}
 .muted{color:var(--muted)}.new{border-color:var(--ok)}.new pre{white-space:pre-wrap;word-break:break-all}.err{color:var(--danger);font-weight:600}
 .grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}@media(max-width:720px){.grid{grid-template-columns:1fr}}
+nav{display:flex;gap:6px;flex-wrap:wrap;margin:0 0 16px}nav a{color:var(--text);text-decoration:none;
+padding:6px 12px;border:1px solid var(--line);border-radius:999px;background:var(--card);font-size:14px}
+select,textarea{width:100%;padding:9px 10px;border:1px solid var(--line);border-radius:8px;background:var(--bg);
+color:var(--text);font:inherit}.row{display:grid;grid-template-columns:2fr 1fr;gap:10px}
+@media(max-width:720px){.row{grid-template-columns:1fr}}.inline{display:inline}
+.flash{border-color:var(--ok)}.flash.err{border-color:var(--danger)}.flash pre{white-space:pre-wrap;word-break:break-all}
+.tag{font-size:12px;padding:1px 8px;border-radius:999px;border:1px solid var(--line);color:var(--muted);white-space:nowrap}
+.tag.ok{color:var(--ok);border-color:var(--ok)}.tag.warn{color:var(--danger);border-color:var(--danger)}
+td form{margin:0}.acts{display:flex;gap:6px;flex-wrap:wrap}
+button.ghost{background:none;color:var(--accent);border:1px solid var(--accent);padding:4px 10px}
 """
+
+ICON_SVG = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><rect width="512" height="512" rx="112"
+fill="#2f5d50"/><rect x="136" y="232" width="240" height="176" rx="28" fill="#fff"/><path d="M188 232v-52a68 68 0 0 1
+136 0v52" fill="none" stroke="#fff" stroke-width="36" stroke-linecap="round"/><circle cx="256" cy="312" r="26"
+fill="#2f5d50"/></svg>"""
 
 
 def page(title: str, body: str, status: int = 200, headers: dict | None = None) -> HTMLResponse:
     html = (f"<!doctype html><html lang=es><head><meta charset=utf-8>"
             f"<meta name=viewport content='width=device-width,initial-scale=1'>"
+            f"<meta name=theme-color content='#2f5d50'><meta name=apple-mobile-web-app-capable content=yes>"
+            f"<link rel=manifest href='/_vault/manifest.webmanifest'><link rel=icon href='/_vault/icon.svg'>"
+            f"<link rel=apple-touch-icon href='/_vault/icon.svg'>"
             f"<title>{escape(title)}</title><style>{CSS}</style></head><body><main>{body}</main></body></html>")
     return HTMLResponse(html, status_code=status, headers={**SECURITY_HEADERS, **(headers or {})})
 
@@ -106,15 +125,38 @@ def panel_routes(gw: "Gateway") -> list[Route]:
             return None, form
         return s, form
 
-    def login_page(error: str = "", status: int = 200) -> HTMLResponse:
+    def csrf_field(s: dict) -> str:
+        return f"<input type=hidden name=csrf value='{escape(s['csrf'])}'>"
+
+    def button(s: dict, action: str, label: str, fields: dict, cls: str = "danger") -> str:
+        hidden = "".join(f"<input type=hidden name='{escape(k)}' value='{escape(str(v))}'>" for k, v in fields.items())
+        return (f"<form class=inline method=post action='{escape(action)}'>{csrf_field(s)}{hidden}"
+                f"<button class={cls} type=submit>{escape(label)}</button></form>")
+
+    def back(s: dict, kind: str, text: str, anchor: str = "", detail: str = "") -> Response:
+        s["flash"] = (kind, text, detail)
+        return RedirectResponse(f"/_vault/#{anchor}" if anchor else "/_vault/", 303, headers=SECURITY_HEADERS)
+
+    def safe_next(value: str) -> str:
+        return value if value.startswith("/_vault/") and "//" not in value and "\\" not in value else "/_vault/"
+
+    class Ctx:  # utilidades para las secciones que añade la app autoalojada
+        pass
+    ctx = Ctx()
+    ctx.current, ctx.form_checked, ctx.csrf_field, ctx.button, ctx.back = current, form_checked, csrf_field, button, back
+
+    def login_page(error: str = "", status: int = 200, next_url: str = "/_vault/") -> HTMLResponse:
         if not gw.bundle.admin.get("password"):
-            return page("Bóveda", "<div class=card><h1>Panel desactivado</h1><p>Fija una contraseña con "
-                                  "<code>vault admin password</code> y reinicia <code>vault serve</code>.</p></div>", 503)
+            hint = ("Abre el enlace de configuración inicial que aparece en los logs de la app."
+                    if getattr(gw, "setup_token", None) else
+                    "Fija una contraseña con <code>vault admin password</code> y reinicia <code>vault serve</code>.")
+            return page("Bóveda", f"<div class=card><h1>Falta configurar el panel</h1><p>{hint}</p></div>", 503)
         err = f"<p class=err>{escape(error)}</p>" if error else ""
         return page("Bóveda · acceso", f"""
 <div class=card style="max-width:380px;margin:12vh auto">
-<h1>Bóveda</h1><p class=muted>Panel de API keys</p>{err}
-<form method=post action="/_vault/login"><label for=pw>Contraseña de administrador</label>
+<h1>Bóveda</h1><p class=muted>{escape(getattr(gw, "title", "Panel de API keys"))}</p>{err}
+<form method=post action="/_vault/login"><input type=hidden name=next value='{escape(safe_next(next_url))}'>
+<label for=pw>Contraseña de administrador</label>
 <input id=pw type=password name=password autocomplete=current-password autofocus required>
 <p><button type=submit>Entrar</button></p></form></div>""", status)
 
@@ -162,12 +204,22 @@ def panel_routes(gw: "Gateway") -> list[Route]:
             f"<td>{'denegado' if ev.get('denied') else escape(str(ev.get('status', ev.get('error', ''))))}</td></tr>"
             for ev in recent) or "<tr><td colspan=5 class=muted>Sin actividad todavía.</td></tr>"
 
+        flash = ""
+        if s.get("flash"):
+            kind, text, detail = s.pop("flash")
+            extra = f"<pre>{escape(detail)}</pre>" if detail else ""
+            flash = f"<div class='card flash {'err' if kind == 'err' else ''}'><b>{escape(text)}</b>{extra}</div>"
+        hosted = gw.sections(ctx, s, request) if hasattr(gw, "sections") else ""
+        nav = ("<nav><a href='#servidores'>Servidores</a><a href='#accesos'>Accesos de IA</a><a href='#claves'>Claves</a>"
+               "<a href='#apikeys'>API keys</a><a href='#apis'>APIs</a><a href='#actividad'>Actividad</a>"
+               "<a href='#ajustes'>Ajustes</a></nav>") if hosted else ""
+        title = "Bóveda" if hosted else "Bóveda · API keys"
         return page("Bóveda · panel", f"""
-<header><h1>Bóveda · API keys</h1>
+<header><h1>{title}</h1>
 <form method=post action="/_vault/logout"><input type=hidden name=csrf value='{csrf}'>
 <button class=link type=submit>Salir</button></form></header>
-{new_html}{err_html}
-<div class=grid>
+{nav}{new_html}{err_html}{flash}{hosted}
+<div class=grid id=apikeys>
 <div class=card><h2>Nueva API key para un servicio</h2>
 <form method=post action="/_vault/keys"><input type=hidden name=csrf value='{csrf}'>
 <label for=n>Nombre del servicio</label><input id=n type=text name=name required pattern="[A-Za-z0-9_.\\-]{{1,64}}" placeholder="mi-app-produccion">
@@ -178,13 +230,13 @@ def panel_routes(gw: "Gateway") -> list[Route]:
 <p>Cada servicio recibe su propia key <code>vt_…</code>. La pasarela la cambia por la clave real del proveedor,
 que nunca sale de aquí. Si una key se filtra, la revocas sin tocar tu cuenta de OpenAI o Anthropic.</p>
 <p class=muted>Para automatizarlo desde tus despliegues usa la API de administración
-(<code>POST {escape(base)}/_vault/api/keys</code>) con un token de <code>vault admin token create</code>.</p></div>
+(<code>POST {escape(base)}/_vault/api/keys</code>) con un token de <code>vault admin token-create</code>.</p></div>
 </div>
 <div class=card><h2>API keys</h2><div class=scroll><table><thead><tr><th>Servicio</th><th>APIs</th><th>Creada</th>
 <th>Caduca</th><th>Peticiones</th><th>Último uso (UTC)</th><th></th></tr></thead><tbody>{key_rows}</tbody></table></div></div>
-<div class=card><h2>APIs disponibles</h2><div class=scroll><table><thead><tr><th>Nombre</th><th>Descripción</th>
+<div class=card id=apis><h2>APIs disponibles</h2><div class=scroll><table><thead><tr><th>Nombre</th><th>Descripción</th>
 <th>URL para tus servicios</th><th>Proveedor</th></tr></thead><tbody>{api_rows}</tbody></table></div></div>
-<div class=card><h2>Actividad reciente</h2><div class=scroll><table><thead><tr><th>Fecha</th><th>Servicio</th>
+<div class=card id=actividad><h2>Actividad de API keys</h2><div class=scroll><table><thead><tr><th>Fecha</th><th>Servicio</th>
 <th>API</th><th>Petición</th><th>Estado</th></tr></thead><tbody>{recent_rows}</tbody></table></div></div>""")
 
     # ─── Panel ──────────────────────────────────────────────────────────────────
@@ -205,15 +257,16 @@ que nunca sale de aquí. Si una key se filtra, la revocas sin tocar tu cuenta de
         if not same_origin(request):
             return login_page("Origen no permitido.", 403)
         form = await request.form()
+        next_url = safe_next(str(form.get("next", "/_vault/")))
         ok = await anyio.to_thread.run_sync(K.check_admin_password, gw.bundle, str(form.get("password", "")))
         if not ok:
             window.append(time.time())
             await anyio.sleep(1)
-            return login_page("Contraseña incorrecta.", 401)
+            return login_page("Contraseña incorrecta.", 401, next_url)
         window.clear()
         sid = secrets.token_urlsafe(32)
         sessions[sid] = {"exp": time.time() + SESSION_TTL, "csrf": secrets.token_urlsafe(32)}
-        resp = RedirectResponse("/_vault/", 303, headers=SECURITY_HEADERS)
+        resp = RedirectResponse(next_url, 303, headers=SECURITY_HEADERS)
         resp.set_cookie(COOKIE, sid, max_age=SESSION_TTL, path="/_vault", httponly=True, samesite="strict",
                         secure=request.url.scheme == "https")
         return resp
@@ -295,7 +348,52 @@ que nunca sale de aquí. Si una key se filtra, la revocas sin tocar tu cuenta de
         gw.save()
         return Response(status_code=204)
 
-    return [
+    # ─── Configuración inicial (primer arranque de la app) ──────────────────────
+
+    async def setup(request: Request) -> Response:
+        token = getattr(gw, "setup_token", None)
+        given = request.query_params.get("t", "")
+        if gw.bundle.admin.get("password") or not token or not hmac.compare_digest(given, token):
+            return page("Bóveda", "<div class=card><h1>Enlace no válido</h1><p>El panel ya está configurado "
+                                  "o el enlace caducó.</p></div>", 403)
+        err = ""
+        if request.method == "POST":
+            if not same_origin(request):
+                return page("Bóveda", "<p class=err>Origen no permitido.</p>", 403)
+            form = await request.form()
+            pw, pw2 = str(form.get("password", "")), str(form.get("password2", ""))
+            try:
+                if pw != pw2:
+                    raise ValueError("las contraseñas no coinciden")
+                await anyio.to_thread.run_sync(K.set_admin_password, gw.bundle, pw)
+            except ValueError as e:
+                err = f"<p class=err>{escape(str(e))}</p>"
+            else:
+                gw.setup_token = None
+                gw.save()
+                return RedirectResponse("/_vault/", 303, headers=SECURITY_HEADERS)
+        return page("Bóveda · configuración", f"""<div class=card style="max-width:420px;margin:10vh auto">
+<h1>Bienvenido</h1><p class=muted>Elige la contraseña de administrador del panel (mínimo 12 caracteres).
+Úsala solo aquí: protege tus servidores y tus claves.</p>{err}
+<form method=post><label for=p1>Contraseña</label><input id=p1 type=password name=password minlength=12 required autofocus>
+<label for=p2>Repítela</label><input id=p2 type=password name=password2 minlength=12 required>
+<p><button type=submit>Guardar y entrar</button></p></form></div>""")
+
+    async def manifest(request: Request) -> Response:
+        return JSONResponse({"name": "Bóveda", "short_name": "Bóveda", "start_url": "/_vault/", "scope": "/_vault/",
+                             "display": "standalone", "background_color": "#f7f7f5", "theme_color": "#2f5d50",
+                             "icons": [{"src": "/_vault/icon.svg", "sizes": "any", "type": "image/svg+xml"}]},
+                            media_type="application/manifest+json")
+
+    async def icon(request: Request) -> Response:
+        return Response(ICON_SVG, media_type="image/svg+xml", headers={"Cache-Control": "max-age=86400"})
+
+    ctx.login_page = login_page
+    extra = gw.routes(ctx) if hasattr(gw, "routes") else []
+    return extra + [
+        Route("/_vault/setup", setup, methods=["GET", "POST"]),
+        Route("/_vault/manifest.webmanifest", manifest),
+        Route("/_vault/icon.svg", icon),
         Route("/_vault", home),
         Route("/_vault/", home),
         Route("/_vault/login", login, methods=["POST"]),

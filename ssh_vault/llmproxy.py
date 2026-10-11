@@ -65,9 +65,19 @@ class Gateway:
 
 def build_app(bundle: Bundle, audit_log: Path | None = None, save=None, panel: bool = False) -> Starlette:
     gw = Gateway(bundle, audit_log, save)
-    secrets: dict[str, Secret] = {
-        name: secret_from_spec(name, spec) for name, spec in bundle.secrets.items() if spec.get("base_url")
-    }
+    routes = []
+    if panel:
+        from .panel import panel_routes
+        routes += panel_routes(gw)
+    return Starlette(routes=routes + proxy_routes(gw))
+
+
+def proxy_routes(gw: Gateway) -> list[Route]:
+    bundle = gw.bundle
+    audit_log = gw.audit_log
+
+    def secrets() -> dict[str, Secret]:  # en vivo: el panel puede añadir APIs
+        return {n: secret_from_spec(n, sp) for n, sp in bundle.secrets.items() if sp.get("base_url")}
 
     def audit(**event):
         if audit_log is None:
@@ -83,7 +93,7 @@ def build_app(bundle: Bundle, audit_log: Path | None = None, save=None, panel: b
         if grant is None:
             await anyio.sleep(1)
             return _error(401, "API key de la bóveda inválida, revocada o caducada")
-        sec = secrets.get(name)
+        sec = secrets().get(name)
         if sec is None or name not in grant.get("secrets", ()):
             audit(app=grant["name"], secret=name, denied=True)
             return _error(403, f"el token {grant['name']!r} no puede usar {name!r}")
@@ -137,12 +147,7 @@ def build_app(bundle: Bundle, audit_log: Path | None = None, save=None, panel: b
         if grant is None:
             return _error(401, "API key de la bóveda inválida, revocada o caducada")
         return JSONResponse({"service": "ssh-vault", "app": grant["name"],
-                             "apis": sorted(set(grant["secrets"]) & secrets.keys())})
+                             "apis": sorted(set(grant["secrets"]) & secrets().keys())})
 
     methods = ["GET", "POST", "PUT", "PATCH", "DELETE"]
-    routes = []
-    if panel:
-        from .panel import panel_routes
-        routes += panel_routes(gw)
-    routes += [Route("/", index), Route("/{secret}/{path:path}", proxy, methods=methods)]
-    return Starlette(routes=routes)
+    return [Route("/", index), Route("/{secret}/{path:path}", proxy, methods=methods)]

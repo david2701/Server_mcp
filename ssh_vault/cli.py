@@ -470,23 +470,50 @@ def cmd_admin(a):
 
 def cmd_serve(a):
     import uvicorn
-    from .llmproxy import build_app
 
     local = a.host in ("127.0.0.1", "localhost", "::1")
-    if not local and not (a.tls_cert and a.tls_key):
-        die("Para escuchar fuera de localhost necesitas --tls-cert y --tls-key "
-            "(o pon delante un proxy HTTPS como Caddy y deja --host 127.0.0.1).")
-    b = read()
-    if a.panel and not b.admin.get("password"):
-        die("El panel necesita contraseña: ejecuta `vault admin password` primero.")
-    if not b.tokens and not a.panel:
-        print("Aviso: no hay API keys; crea una con `vault token create <app> --secrets ...`", file=sys.stderr)
-    audit = Path(os.environ.get("VAULT_AUDIT_LOG", "~/.local/state/ssh-vault/audit.log")).expanduser()
+    if not local and not (a.tls_cert and a.tls_key) and not a.behind_proxy:
+        die("Para escuchar fuera de localhost necesitas --tls-cert y --tls-key, o --behind-proxy si "
+            "delante hay un proxy HTTPS (Caddy) en una red privada, como en el docker-compose.")
     path = B.default_vault_path()
-    app = build_app(b, audit, save=lambda bundle: B.write(bundle, path), panel=a.panel)
-    if a.panel:
-        print(f"Panel: http{'s' if a.tls_cert else ''}://{a.host}:{a.port}/_vault/", file=sys.stderr)
-    uvicorn.run(app, host=a.host, port=a.port, log_level="warning",
+    audit = Path(os.environ.get("VAULT_AUDIT_LOG", "~/.local/state/ssh-vault/audit.log")).expanduser()
+
+    if a.public_url:
+        # App autoalojada completa: panel + MCP remoto + proxy. Sin Mac: bóveda propia del servidor.
+        from .hosted import build_hosted_app
+
+        if not path.exists():
+            public = ensure_identity("none")
+            recovery = B.x25519.Identity.generate()
+            rec_path = B.config_dir() / "recovery-key.txt"
+            fd = os.open(rec_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "w") as fh:
+                fh.write(f"# Llave de recuperación de ssh-vault\n{recovery}\n")
+            B.write(B.Bundle(recipients={"app": public, "recuperacion": str(recovery.to_public())}), path)
+            print(f"Bóveda nueva creada en {path}. Llave de recuperación en {rec_path}: "
+                  "guárdala fuera de este servidor y bórrala de aquí.", file=sys.stderr)
+        b = read()
+        setup_token = None
+        if not b.admin.get("password"):
+            import secrets as _s
+            setup_token = _s.token_urlsafe(24)
+            print(f"\nConfiguración inicial (un solo uso): {a.public_url.rstrip('/')}/_vault/setup?t={setup_token}\n",
+                  file=sys.stderr, flush=True)
+        app = build_hosted_app(b, lambda bundle: B.write(bundle, path), a.public_url, audit, setup_token)
+        print(f"Panel: {a.public_url.rstrip('/')}/_vault/   MCP: {a.public_url.rstrip('/')}/mcp", file=sys.stderr)
+    else:
+        from .llmproxy import build_app
+
+        b = read()
+        if a.panel and not b.admin.get("password"):
+            die("El panel necesita contraseña: ejecuta `vault admin password` primero.")
+        if not b.tokens and not a.panel:
+            print("Aviso: no hay API keys; crea una con `vault token create <app> --secrets ...`", file=sys.stderr)
+        app = build_app(b, audit, save=lambda bundle: B.write(bundle, path), panel=a.panel)
+        if a.panel:
+            print(f"Panel: http{'s' if a.tls_cert else ''}://{a.host}:{a.port}/_vault/", file=sys.stderr)
+    uvicorn.run(app, host=a.host, port=a.port, log_level="warning", proxy_headers=True,
+                forwarded_allow_ips="*" if a.behind_proxy else None,
                 ssl_certfile=a.tls_cert, ssl_keyfile=a.tls_key)
 
 
@@ -612,6 +639,11 @@ def main(argv: list[str] | None = None) -> None:
 
     s = sub.add_parser("serve", help="pasarela: API proxy de LLMs (+ panel web con --panel)")
     s.add_argument("--panel", action="store_true", help="activa el panel web y la API de administración en /_vault/")
+    s.add_argument("--behind-proxy", action="store_true",
+                   help="permite escuchar sin TLS fuera de localhost porque un proxy HTTPS (Caddy) termina el TLS")
+    s.add_argument("--public-url", default=os.environ.get("VAULT_PUBLIC_URL"),
+                   help="URL pública HTTPS (p. ej. https://vault.tudominio.com): activa la app completa "
+                        "con servidores SSH, MCP remoto y OAuth")
     s.add_argument("--host", default="127.0.0.1")
     s.add_argument("--port", type=int, default=8787)
     s.add_argument("--tls-cert")

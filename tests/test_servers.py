@@ -34,7 +34,8 @@ class Sshd:
         self.dir = tmp / "sshd"
         self.dir.mkdir()
         self.port = free_port()
-        (self.dir / "authorized_keys").write_text(authorized_pub + "\n")
+        self.ak = self.dir / "authorized_keys"
+        self.ak.write_text(authorized_pub + "\n" if authorized_pub else "")
         self.new_host_key()
 
     def new_host_key(self):
@@ -47,7 +48,7 @@ class Sshd:
 Port {self.port}
 ListenAddress 127.0.0.1
 HostKey {self.dir}/hostkey
-AuthorizedKeysFile {self.dir}/authorized_keys
+AuthorizedKeysFile {self.ak}
 PasswordAuthentication no
 KbdInteractiveAuthentication no
 PermitRootLogin prohibit-password
@@ -84,9 +85,9 @@ def env(tmp_path):
     pro.vault("ssh", "import", "servidores", str(keyfile))
     keyfile.unlink()  # la llave ya solo existe dentro de la bóveda
     (tmp_path / "servidores.pub").unlink()
-    pro.vault("server", "add", "web", f"root@127.0.0.1", "-p", str(sshd.port), "--key", "servidores", "-y",
+    pro.vault("server", "add", "web", "root@127.0.0.1", "-p", str(sshd.port), "--key", "servidores", "-y",
               "--description", "servidor de pruebas")
-    pro.vault("server", "add", "db", f"root@127.0.0.1", "-p", str(sshd.port), "--key", "servidores", "-y",
+    pro.vault("server", "add", "db", "root@127.0.0.1", "-p", str(sshd.port), "--key", "servidores", "-y",
               "--read-only")
 
     # Otra Mac, sin nada en ~/.ssh: solo la bóveda sincronizada.
