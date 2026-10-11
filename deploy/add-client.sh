@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
-# Autoriza a una Mac cliente: su llave SOLO podrá lanzar el MCP ssh-vault.
-# Uso: deploy/add-client.sh <nombre> "<ssh-ed25519 AAAA... comentario>"
+# Autoriza a un cliente. Su llave SOLO podrá usar ssh-vault:
+#   rol mcp (por defecto): Claude (MCP) + `get` de los secretos de su lista reveal
+#   rol app (--app):       solo `get`; para apps y servidores, sin acceso al MCP
+# Uso: deploy/add-client.sh [--app] <nombre> "<ssh-ed25519 AAAA... comentario>"
 #      deploy/add-client.sh --remove <nombre>
 set -euo pipefail
 
@@ -15,7 +17,9 @@ if [[ "${1:-}" == "--remove" ]]; then
   exit 0
 fi
 
-NAME="${1:?Uso: $0 <nombre> \"<llave pública>\"}"
+ROLE=mcp
+if [[ "${1:-}" == "--app" ]]; then ROLE=app; shift; fi
+NAME="${1:?Uso: $0 [--app] <nombre> \"<llave pública>\"}"
 KEY="${2:?Falta la llave pública}"
 [[ "$NAME" =~ ^[A-Za-z0-9_.-]{1,64}$ ]] || { echo "Nombre inválido"; exit 1; }
 [[ "$KEY" =~ ^(ssh-ed25519|sk-ssh-ed25519@openssh.com|ecdsa-sha2-nistp256|sk-ecdsa-sha2-nistp256@openssh.com)\ [A-Za-z0-9+/=]+(\ .*)?$ ]] \
@@ -29,5 +33,6 @@ if grep -q -- "--client $NAME\"" "$AUTH"; then
 fi
 # restrict: sin terminal, sin reenvío de puertos, agente ni X11.
 # command: ignora lo que pida el cliente y lanza siempre el MCP.
-echo "restrict,command=\"$PYTHON -m ssh_vault --client $NAME\" $KEY" >> "$AUTH"
-echo "Cliente '$NAME' autorizado (solo puede usar ssh-vault)."
+echo "restrict,command=\"$PYTHON -m ssh_vault --role $ROLE --client $NAME\" $KEY" >> "$AUTH"
+echo "Cliente '$NAME' autorizado con rol $ROLE."
+echo "Los secretos que pueda leer se declaran en [clients.$NAME] reveal = [...] de config.toml."

@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# Lanza una app con secretos de la bóveda en variables de entorno, sin escribirlos en disco.
+# Uso: vault-run VARIABLE=secreto [VARIABLE=secreto ...] -- comando [args...]
+#   p. ej.: vault-run OPENAI_API_KEY=openai DATABASE_URL=db_url -- npm start
+# Usa el host "ssh-vault" de ~/.ssh/config (cámbialo con SSH_VAULT_HOST).
+set -euo pipefail
+HOST="${SSH_VAULT_HOST:-ssh-vault}"
+
+vars=(); names=()
+while [[ $# -gt 0 && "$1" != "--" ]]; do
+  [[ "$1" =~ ^([A-Za-z_][A-Za-z0-9_]*)=([A-Za-z0-9_.-]+)$ ]] || { echo "Argumento inválido: $1" >&2; exit 2; }
+  vars+=("${BASH_REMATCH[1]}"); names+=("${BASH_REMATCH[2]}")
+  shift
+done
+[[ "${1:-}" == "--" && $# -ge 2 && ${#vars[@]} -gt 0 ]] || { sed -n '3,5p' "$0" >&2; exit 2; }
+shift
+
+# Una sola conexión para todos los secretos; la respuesta es JSON si hay varios.
+json="$(ssh -T -o BatchMode=yes "$HOST" get "${names[@]}")"
+for i in "${!vars[@]}"; do
+  if [[ ${#names[@]} -eq 1 ]]; then
+    value="$json"
+  else
+    value="$(printf '%s' "$json" | python3 -c 'import json,sys; print(json.load(sys.stdin)[sys.argv[1]], end="")' "${names[$i]}")"
+  fi
+  export "${vars[$i]}=$value"
+done
+unset json value
+exec "$@"

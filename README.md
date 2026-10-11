@@ -1,8 +1,13 @@
-# ssh-vault — MCP personal para tus servidores SSH
+# ssh-vault — tu bóveda personal: SSH, API keys y secretos de tus apps
 
-Usa los accesos SSH que viven en **una** de tus MacBook desde **cualquiera** de tus
-Macs (con Claude Code) sin copiar nunca las llaves privadas. El canal es el propio
-SSH, así que no hay servidor HTTP, tokens ni servicios de terceros.
+Una de tus MacBook guarda todo: llaves SSH, claves de LLMs (OpenAI, Anthropic, Gemini…)
+y secretos de tus apps. Desde **cualquier** otra Mac o servidor los usas a través de
+ella, con el propio SSH como canal: sin servidor HTTP, sin tokens y sin terceros.
+
+- **Claude (MCP):** ejecuta comandos en tus servidores y llama a APIs con tus claves
+  **sin ver nunca ni las llaves ni los valores**.
+- **Tus apps:** `vault-run OPENAI_API_KEY=openai -- npm start` carga los secretos en
+  memoria al arrancar, solo para los clientes que tú autorices.
 
 ```
  MacBook cliente                          MacBook "bóveda"                       Tus servidores
@@ -18,6 +23,15 @@ Claude Code lanza `ssh -T ssh-vault` como si fuera un MCP local. En la bóveda,
 `authorized_keys` obliga a esa llave a ejecutar **solo** `ssh_vault`, que habla MCP
 por stdin/stdout y usa las llaves de la bóveda para llegar a tus servidores.
 
+## Qué puede hacer cada tipo de cliente
+
+| | Rol `mcp` (tus Macs con Claude) | Rol `app` (`add-client.sh --app`, servidores y apps) |
+|---|---|---|
+| Ejecutar comandos en servidores (MCP) | ✅ según las políticas de cada servidor | ❌ |
+| Llamar APIs con `call_api` (Claude no ve la clave) | ✅ solo hacia el `base_url` de cada secreto | ❌ |
+| Leer el valor de un secreto (`get` / `vault-run`) | solo los que estén en `[clients.<nombre>] reveal` | solo los que estén en `[clients.<nombre>] reveal` |
+| Abrir una shell o reenviar puertos | ❌ | ❌ |
+
 ## Modelo de seguridad
 
 | Capa | Qué protege |
@@ -29,7 +43,10 @@ por stdin/stdout y usa las llaves de la bóveda para llegar a tus servidores.
 | **Lista de servidores** | Solo se aceptan los servidores declarados en `config.toml`. Los alias se validan para evitar la inyección de opciones de `ssh`. |
 | **Políticas por servidor** | `read_only = true` o `allow_commands = [regex…]` limitan qué se puede ejecutar. |
 | **ssh saliente endurecido** | `BatchMode=yes`, `StrictHostKeyChecking=yes`, `ForwardAgent=no`, timeout y salida truncada. |
-| **Auditoría** | Cada llamada, incluidas las denegadas, queda en `~/.local/state/ssh-vault/audit.log` con el nombre de la Mac cliente. |
+| **Secretos en el Llavero** | Los valores viven en el Llavero de la bóveda (`deploy/secret.sh`), no en `config.toml` ni en el repo. |
+| **Proxy de APIs** | Con `call_api`, la clave solo se envía al `base_url` declarado: no se permiten `..` ni URLs absolutas, no se siguen redirecciones (evita que la clave salte a otro dominio), no se pueden sobrescribir las cabeceras de autenticación, se exige HTTPS y la clave se borra de la respuesta (`[SECRETO]`). |
+| **Lectura en claro mínima** | `get` exige que el secreto esté en la lista `reveal` de ese cliente concreto. Por defecto, nadie puede leer nada. |
+| **Auditoría** | Cada llamada (comandos, `call_api`, `get`), incluidas las denegadas, queda en `~/.local/state/ssh-vault/audit.log` con el nombre del cliente. Nunca se registran valores ni cuerpos. |
 
 ## 1. Mac bóveda (la que tiene las llaves)
 
@@ -81,6 +98,40 @@ Para Claude Desktop, añade lo mismo en `claude_desktop_config.json`:
 { "mcpServers": { "ssh-vault": { "command": "ssh", "args": ["-T", "ssh-vault"] } } }
 ```
 
+## 4. Secretos (API keys de LLMs y otros)
+
+En la **bóveda**:
+
+```bash
+./deploy/secret.sh set openai          # pide el valor sin mostrarlo y lo guarda en el Llavero
+./deploy/secret.sh list
+nano ~/.config/ssh-vault/config.toml   # declara [secrets.openai] y, si hace falta, [clients.X] reveal
+```
+
+**Desde Claude**, sin revelar la clave:
+> «Usa call_api con el secreto anthropic para listar los modelos disponibles»
+
+**Para tus apps** (en una Mac o un servidor autorizado):
+
+```bash
+# Un servidor de producción: una llave dedicada con rol app
+ssh-keygen -t ed25519 -f ~/.ssh/ssh_vault_ed25519 -N ''       # en el servidor
+./deploy/add-client.sh --app prod-web "ssh-ed25519 AAAA…"      # en la bóveda
+# + [clients.prod-web] reveal = ["openai", "db_url_prod"] en config.toml
+
+# Lanzar la app con los secretos en variables de entorno (no se escriben en disco)
+vault-run OPENAI_API_KEY=openai DATABASE_URL=db_url_prod -- node server.js
+# o un valor suelto
+ssh ssh-vault get openai
+```
+
+Copia `deploy/vault-run` a tu `PATH` (p. ej. `~/.local/bin/`) en cada cliente que lo use.
+
+> **Importante:** un secreto que permites leer en claro a un cliente queda al alcance de
+> cualquier programa de ese usuario en esa máquina, incluido un agente de IA con terminal.
+> Para lo que Claude necesite, usa `call_api`, y reserva `reveal` para las apps que de
+> verdad requieren el valor.
+
 ## Herramientas MCP
 
 | Herramienta | Descripción |
@@ -88,6 +139,8 @@ Para Claude Desktop, añade lo mismo en `claude_desktop_config.json`:
 | `list_servers` | Muestra los servidores declarados y su modo (completo, solo lectura o comandos permitidos). |
 | `test_connection(server)` | Comprueba que la bóveda puede autenticarse. |
 | `run_command(server, command, timeout_seconds?)` | Ejecuta el comando y devuelve el código de salida, stdout y stderr. |
+| `list_secrets` | Lista los nombres y descripciones de los secretos y su `base_url`; nunca los valores. |
+| `call_api(secret, path, method?, body?, headers?)` | Llama a la API del secreto con la clave inyectada por la bóveda y devuelve el estado y el cuerpo (con la clave borrada). |
 
 ## Notas
 
@@ -101,4 +154,4 @@ Para Claude Desktop, añade lo mismo en `claude_desktop_config.json`:
 pip install -e '.[dev]' && pytest
 ```
 
-Las pruebas usan un binario `ssh` falso y comprueban las políticas, la auditoría y el flujo MCP completo, tanto en memoria como como proceso stdio.
+Las pruebas usan un binario `ssh` falso y una API HTTP local. Comprueban las políticas, el proxy (salirse de `base_url`, redirecciones, borrado de la clave), los permisos de `get`, la auditoría y el flujo MCP completo, tanto en memoria como como proceso stdio.

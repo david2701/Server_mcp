@@ -69,7 +69,7 @@ def test_rejects_bad_host(tmp_path):
 
 async def exercise(client):
     names = {t.name for t in (await client.list_tools()).tools}
-    assert names == {"list_servers", "test_connection", "run_command"}
+    assert names == {"list_servers", "test_connection", "run_command", "list_secrets", "call_api"}
 
     listing = await client.call_tool("list_servers", {})
     assert "web" in listing.content[0].text and "solo lectura" in listing.content[0].text

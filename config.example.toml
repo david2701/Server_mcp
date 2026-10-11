@@ -21,3 +21,39 @@ host = "backups"
 description = "Servidor de respaldos"
 # Lista blanca propia (expresiones regulares que deben coincidir con el comando completo)
 allow_commands = ['ls -la /backups(/[A-Za-z0-9_.-]+)*', 'du -sh /backups']
+
+# ─── Secretos (API keys, contraseñas...) ───────────────────────────────────────
+# Los valores NO van aquí: se guardan en el Llavero con deploy/secret.sh set <nombre>.
+# secrets_backend = "keychain"   # o "file" + secrets_file (JSON 0600, para bóvedas Linux)
+#
+# Con base_url, Claude puede usarlo vía call_api: la bóveda inyecta la clave y solo
+# la envía a ese prefijo. Sin base_url, solo sirve para que tus apps lo lean (get).
+
+[secrets.openai]
+description = "OpenAI"
+base_url = "https://api.openai.com/v1/"
+header = "Authorization: Bearer {secret}"
+
+[secrets.anthropic]
+description = "Anthropic (Claude)"
+base_url = "https://api.anthropic.com/v1/"
+header = "x-api-key: {secret}"
+extra_headers = { "anthropic-version" = "2023-06-01" }
+
+[secrets.gemini]
+description = "Google Gemini"
+base_url = "https://generativelanguage.googleapis.com/v1beta/"
+header = "x-goog-api-key: {secret}"
+
+[secrets.db_url_prod]
+description = "Cadena de conexión de la base de datos de producción"
+
+# ─── Clientes: qué secretos puede LEER EN CLARO cada uno (get / vault-run) ─────
+# El nombre es el de add-client.sh. Un cliente que no aparece aquí no puede leer nada
+# (aunque, si tiene rol mcp, sí puede usar call_api sin ver los valores).
+
+[clients.prod-web]               # servidor autorizado con add-client.sh --app
+reveal = ["openai", "db_url_prod"]
+
+[clients.macbook-pro]            # tu Mac de desarrollo, para `vault-run ... -- npm run dev`
+reveal = ["openai", "anthropic"]

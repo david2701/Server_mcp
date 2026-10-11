@@ -7,13 +7,17 @@ bóveda lo fuerza con `command="..."` en authorized_keys (ver deploy/add-client.
 from __future__ import annotations
 
 import argparse
+import json
+import os
+import shlex
+import sys
 from pathlib import Path
 
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
 
-from . import runner
+from . import apiproxy, runner
 from .config import NAME_RE, Config, load_config
 
 
@@ -21,9 +25,10 @@ def build_mcp(cfg: Config, client: str = "local") -> MCPServer:
     mcp = MCPServer(
         name="ssh-vault",
         instructions=(
-            "Ejecuta comandos en los servidores del usuario a través de la Mac que "
-            "guarda sus llaves SSH. Usa list_servers primero. Las llaves privadas "
-            "nunca están disponibles a través de este servidor."
+            "Bóveda personal del usuario. Ejecuta comandos en sus servidores "
+            "(list_servers, run_command) y llama a APIs con sus claves "
+            "(list_secrets, call_api). Las llaves SSH y los valores de los "
+            "secretos nunca están disponibles a través de este servidor."
         ),
     )
 
@@ -79,18 +84,104 @@ def build_mcp(cfg: Config, client: str = "local") -> MCPServer:
         )
         return result.render()
 
+    @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+    def list_secrets() -> str:
+        """Lista los secretos de la bóveda (nunca sus valores) y a qué API dan acceso."""
+        if not cfg.secrets:
+            return "No hay secretos configurados."
+        lines = []
+        for sec in cfg.secrets.values():
+            target = f"call_api → {sec.base_url}" if sec.base_url else "solo para apps (sin proxy)"
+            lines.append(f"- {sec.name} [{target}] {sec.description}".rstrip())
+        return "\n".join(lines)
+
+    @mcp.tool(annotations=ToolAnnotations(openWorldHint=True))
+    async def call_api(
+        secret: str,
+        path: str,
+        method: str = "GET",
+        body: dict | list | str | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> str:
+        """Llama a una API usando una clave de la bóveda, que la inyecta sin revelarla.
+
+        Args:
+            secret: nombre del secreto tal como aparece en list_secrets.
+            path: ruta relativa a la base_url del secreto (p. ej. "models" o "messages").
+            method: GET, POST, PUT, PATCH o DELETE.
+            body: cuerpo JSON (objeto o texto, opcional).
+            headers: cabeceras extra (las de autenticación están prohibidas).
+        """
+        sec = cfg.secrets.get(secret)
+        if sec is None:
+            raise ToolError(f"Secreto desconocido: {secret!r}. Usa list_secrets.")
+        value = cfg.store.get(sec.name)
+        if value is None:
+            raise ToolError(f"El secreto {secret!r} no tiene valor en la bóveda.")
+        if body is not None and not isinstance(body, str):
+            body = json.dumps(body)
+        try:
+            resp = await apiproxy.call(sec, value, method, path, body, headers,
+                                       cfg.command_timeout, cfg.max_output_bytes)
+        except apiproxy.ProxyError as err:
+            runner.audit(cfg, client=client, tool="call_api", secret=sec.name, method=method,
+                         path=path, error=str(err))
+            raise ToolError(str(err)) from None
+        runner.audit(cfg, client=client, tool="call_api", secret=sec.name, method=method.upper(),
+                     path=path, status=resp.status)
+        return f"status: {resp.status}\n{resp.body}" + ("\n[respuesta truncada]" if resp.truncated else "")
+
     return mcp
 
 
+def reveal(cfg: Config, client: str, args: list[str]) -> int:
+    """`get <secreto>...` para apps: imprime los valores solo si el cliente puede verlos.
+
+    Un nombre: imprime el valor tal cual. Varios: imprime un objeto JSON.
+    """
+    allowed = cfg.clients[client].reveal if client in cfg.clients else frozenset()
+    if not args:
+        print("uso: get <secreto> [<secreto>...]", file=sys.stderr)
+        return 2
+    values: dict[str, str] = {}
+    for name in args:
+        value = cfg.store.get(name) if name in allowed else None
+        runner.audit(cfg, client=client, tool="get", secret=name, denied=value is None)
+        if name not in allowed:
+            print(f"denegado: {client} no puede leer {name!r}", file=sys.stderr)
+            return 1
+        if value is None:
+            print(f"el secreto {name!r} no tiene valor", file=sys.stderr)
+            return 1
+        values[name] = value
+    if len(values) == 1:
+        sys.stdout.write(next(iter(values.values())) + "\n")
+    else:
+        sys.stdout.write(json.dumps(values) + "\n")
+    return 0
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Servidor MCP ssh-vault (stdio)")
+    parser = argparse.ArgumentParser(description="Bóveda ssh-vault (MCP por stdio + secretos para apps)")
     parser.add_argument("--config", help="ruta a config.toml")
-    parser.add_argument("--client", default="local", help="nombre de la Mac cliente, para la auditoría")
+    parser.add_argument("--client", default="local", help="nombre del cliente, para permisos y auditoría")
+    parser.add_argument("--role", choices=("mcp", "app"), default="mcp",
+                        help="mcp: Claude + get; app: solo get (para apps y servidores)")
     args = parser.parse_args()
     if not NAME_RE.match(args.client):
         raise SystemExit(f"nombre de cliente inválido: {args.client!r}")
-
     cfg = load_config(Path(args.config) if args.config else None)
+
+    # Con command= en authorized_keys, sshd pone aquí lo que pidió el cliente.
+    try:
+        requested = shlex.split(os.environ.get("SSH_ORIGINAL_COMMAND", ""))
+    except ValueError:
+        requested = ["<inválido>"]
+    if requested[:1] == ["get"]:
+        raise SystemExit(reveal(cfg, args.client, requested[1:]))
+    if args.role != "mcp" or requested not in ([], ["mcp"]):
+        print("solo se permite: get <secreto>" + (" o mcp" if args.role == "mcp" else ""), file=sys.stderr)
+        raise SystemExit(2)
     build_mcp(cfg, client=args.client).run("stdio")
 
 

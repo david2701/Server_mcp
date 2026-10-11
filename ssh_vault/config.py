@@ -7,6 +7,9 @@ import re
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
+from urllib.parse import urlsplit
+
+from .secrets import FileStore, KeychainStore, SecretStore
 
 DEFAULT_CONFIG = Path("~/.config/ssh-vault/config.toml").expanduser()
 NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
@@ -27,8 +30,29 @@ class Server:
 
 
 @dataclass(frozen=True)
+class Secret:
+    name: str
+    description: str = ""
+    # Si hay base_url, la bóveda puede usar el secreto como proxy (call_api) SOLO
+    # contra ese prefijo. Sin base_url, el secreto solo sirve para `get`.
+    base_url: str | None = None
+    auth_header: str = "Authorization"
+    auth_format: str = "Bearer {secret}"
+    extra_headers: tuple[tuple[str, str], ...] = ()
+
+
+@dataclass(frozen=True)
+class Client:
+    name: str
+    reveal: frozenset[str] = frozenset()  # secretos que puede leer en claro
+
+
+@dataclass(frozen=True)
 class Config:
     servers: dict[str, Server]
+    secrets: dict[str, Secret] = field(default_factory=dict)
+    clients: dict[str, Client] = field(default_factory=dict)
+    store: SecretStore = field(default_factory=KeychainStore)
     command_timeout: int = 60
     max_output_bytes: int = 64 * 1024
     audit_log: Path = field(default_factory=lambda: Path("~/.local/state/ssh-vault/audit.log").expanduser())
@@ -68,7 +92,50 @@ def load_config(path: Path | None = None) -> Config:
             allow_commands=tuple(re.compile(p) for p in (patterns or ())),
         )
 
+    secrets: dict[str, Secret] = {}
+    for name, spec in raw.get("secrets", {}).items():
+        if not NAME_RE.match(name):
+            raise ValueError(f"nombre de secreto inválido: {name!r}")
+        base_url = spec.get("base_url")
+        if base_url is not None:
+            parts = urlsplit(base_url)
+            local = parts.hostname in ("127.0.0.1", "localhost", "::1")
+            if parts.scheme != "https" and not (parts.scheme == "http" and local):
+                raise ValueError(f"{name}: base_url debe usar https")
+            if not parts.hostname or parts.query or parts.fragment or "@" in parts.netloc:
+                raise ValueError(f"{name}: base_url inválida: {base_url!r}")
+            if not base_url.endswith("/"):
+                base_url += "/"
+        header_name, _, header_fmt = spec.get("header", "Authorization: Bearer {secret}").partition(":")
+        if "{secret}" not in header_fmt:
+            raise ValueError(f"{name}: 'header' debe contener {{secret}}")
+        secrets[name] = Secret(
+            name=name,
+            description=spec.get("description", ""),
+            base_url=base_url,
+            auth_header=header_name.strip(),
+            auth_format=header_fmt.strip(),
+            extra_headers=tuple((str(k), str(v)) for k, v in spec.get("extra_headers", {}).items()),
+        )
+
+    clients: dict[str, Client] = {}
+    for name, spec in raw.get("clients", {}).items():
+        reveal = frozenset(spec.get("reveal", ()))
+        unknown = reveal - secrets.keys()
+        if unknown:
+            raise ValueError(f"cliente {name!r}: secretos no declarados {sorted(unknown)}")
+        clients[name] = Client(name=name, reveal=reveal)
+
+    store: SecretStore
+    backend = raw.get("secrets_backend", "keychain")
+    if backend == "keychain":
+        store = KeychainStore()
+    elif backend == "file":
+        store = FileStore(Path(raw["secrets_file"]).expanduser())
+    else:
+        raise ValueError(f"secrets_backend desconocido: {backend!r}")
+
     kwargs = {k: raw[k] for k in ("command_timeout", "max_output_bytes", "ssh_binary") if k in raw}
     if "audit_log" in raw:
         kwargs["audit_log"] = Path(raw["audit_log"]).expanduser()
-    return Config(servers=servers, **kwargs)
+    return Config(servers=servers, secrets=secrets, clients=clients, store=store, **kwargs)
