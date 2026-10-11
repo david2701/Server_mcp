@@ -1,0 +1,27 @@
+# Copia este archivo a ~/.config/ssh-vault/config.toml en la Mac bóveda.
+
+listen_host = "127.0.0.1"      # nunca cambies esto: se publica con `tailscale serve`
+listen_port = 8765
+command_timeout = 60           # segundos máximos por comando
+max_output_bytes = 65536       # se devuelve el final de la salida si es más larga
+# Nombre MagicDNS de esta Mac en tu tailnet (lo imprime install.sh)
+allowed_hosts = ["mi-mac-boveda.tu-tailnet.ts.net"]
+# audit_log = "~/.local/state/ssh-vault/audit.log"
+
+# Cada servidor apunta a un alias de ~/.ssh/config o a user@host.
+# El host ya debe estar en ~/.ssh/known_hosts (conéctate una vez a mano).
+
+[servers.web]
+host = "web-prod"              # alias de ~/.ssh/config
+description = "Nginx + app de producción"
+
+[servers.db]
+host = "deploy@10.0.0.12"
+description = "PostgreSQL"
+read_only = true               # solo diagnósticos (uptime, df, systemctl status, logs...)
+
+[servers.backups]
+host = "backups"
+description = "Servidor de respaldos"
+# Lista blanca propia (expresiones regulares que deben coincidir con el comando completo)
+allow_commands = ['ls -la /backups(/[A-Za-z0-9_.-]+)*', 'du -sh /backups']
